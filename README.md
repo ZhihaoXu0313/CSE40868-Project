@@ -26,3 +26,9 @@ In this project, I have implemented and compared two different neural network ar
 
 ### Database:
 Labeled Faces in the Wild (LFW) is a database of face photographs designed for studying the problem of unconstrained face recognition. This database was created and maintained by researchers at the University of Massachusetts, Amherst. The size of the images in the database is proper for our network scale and it is interesting enough for investigating the performance of our denoising techniques on this database. Gaussian noise is added to each of the image. AE and GNN are used for denoise and the results are compared.
+
+### Performance:
+The accuracy of AE and CNN models on the same test set is 0.7831 and 0.8083, respectively. In general, CNN has fewer parameters but better performance. However, the comparing metric is still questionable. It's hard to say CNN is definitly better than AE on image denoising tasks. There are lots of details need to think when we do the comparison, for example, how to make the encoder and decoder to be fairly comparable to a CNN model.
+
+It can be see in the final figure that although GNN can obtain a higher accuracy, from our human point of view, the AE result is somehow better than CNN result since it seems to capture more details although the accuracy is lower due to some shift of reconstruction. Maybe we should look for a better metric to evaluate the performance of the two models, which could make this project meaningful!
+
