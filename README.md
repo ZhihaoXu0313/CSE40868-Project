@@ -30,6 +30,5 @@ Labeled Faces in the Wild (LFW) is a database of face photographs designed for s
 ### Performance:
 The accuracy of AE and CNN models on the same test set is 0.7831 and 0.8083, respectively. In general, CNN has fewer parameters but better performance. However, the comparing metric is still questionable. It's hard to say CNN is definitly better than AE on image denoising tasks. There are lots of details need to think when we do the comparison, for example, how to make the encoder and decoder to be fairly comparable to a CNN model.
 
-### Ongoing Works:
-It can be see in the final figure that although GNN can obtain a higher accuracy, from our human point of view, the AE result is somehow better than CNN result since it seems to capture more details although the accuracy is lower due to some shift of reconstruction. In addition, comparing with real image, the denoising performance of current models are not good enough. Maybe we should look for a better metric to evaluate the performance of the two models, and improve the performance of models (increase the number of layers, construct complexer encoder and decoder architectures, etc.).
-
+### Generalization Performance
+The models are then tested on a different dataset for checking the generalization performance. 5 images that randomly picked from other datasets, which has not been seen by the model, are fed to models. It can be seen that the accuracy of autoencoder is 0.9057, which is even higher than that on the typical test set. For CNN model, the accuray is 0.7756. These results show that the generalization performance of autoencoder is better than that of convolutional neural networkson the unseen data.
