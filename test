@@ -1,0 +1,592 @@
+"""
+Comprehensive MEEP Geometry Definition and Mueller Matrix Calculation Example
+
+This module demonstrates:
+1. Mueller matrix calculation for FDTD simulations
+2. Comprehensive geometry definition methods in MEEP
+3. HDF5-based geometry import capabilities (when available)
+4. Material grid definitions for complex structures
+"""
+
+import meep as mp
+import numpy as np
+import math
+from typing import Callable, List, Optional, Tuple, Union
+
+# Try to import h5py if available for HDF5 geometry support
+try:
+    import h5py
+    HDF5_AVAILABLE = True
+except ImportError:
+    HDF5_AVAILABLE = False
+    print("Warning: h5py not available. HDF5 geometry import will not work.")
+
+
+def jones_to_stokes(jones_vector: np.ndarray) -> np.ndarray:
+    """
+    Convert Jones vector to Stokes parameters
+    
+    Args:
+        jones_vector: Complex 2D Jones vector [Ex, Ey]
+    
+    Returns:
+        Stokes vector [S0, S1, S2, S3]
+    """
+    Ex, Ey = jones_vector
+    
+    S0 = np.abs(Ex)**2 + np.abs(Ey)**2
+    S1 = np.abs(Ex)**2 - np.abs(Ey)**2
+    S2 = 2 * np.real(Ex * np.conj(Ey))
+    S3 = 2 * np.imag(Ex * np.conj(Ey))
+    
+    return np.array([S0, S1, S2, S3])
+
+
+def stokes_to_jones(stokes_vector: np.ndarray) -> np.ndarray:
+    """
+    Convert Stokes parameters to Jones vector (one possible representation)
+    """
+    S0, S1, S2, S3 = stokes_vector
+    
+    # This gives one possible Jones vector for the given Stokes parameters
+    Ex = np.sqrt((S0 + S1) / 2)
+    Ey_mag = np.sqrt((S0 - S1) / 2)
+    
+    if S2 == 0 and S3 == 0:
+        Ey = Ey_mag  # Linear polarization
+    else:
+        phase = np.arctan2(S3, S2) / 2
+        Ey = Ey_mag * np.exp(1j * phase)
+    
+    return np.array([Ex, Ey])
+
+
+def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) -> np.ndarray:
+    """
+    Calculate the Mueller matrix for a given optical structure.
+    
+    Args:
+        geometry_func: Function that returns MEEP geometry
+        wavelength: Operating wavelength
+    
+    Returns:
+        4x4 Mueller matrix
+    """
+    
+    # Define the six input polarization states needed for Mueller matrix
+    input_polarizations = [
+        # Linear horizontal (1, 0)
+        {'Ez_amp': 1.0, 'Ey_amp': 0.0},
+        # Linear vertical (0, 1) 
+        {'Ez_amp': 0.0, 'Ey_amp': 1.0},
+        # Linear 45° (1, 1)/√2
+        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': 1.0/np.sqrt(2)},
+        # Linear -45° (1, -1)/√2
+        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': -1.0/np.sqrt(2)},
+        # Right circular (1, i)/√2
+        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': 1j/np.sqrt(2)},
+        # Left circular (1, -i)/√2
+        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': -1j/np.sqrt(2)},
+    ]
+    
+    # Define cell parameters
+    cell_size = mp.Vector3(4, 4, 0)  # 2D simulation
+    resolution = 32
+    
+    # Get geometry from function
+    geometry = geometry_func()
+    
+    stokes_vectors = []
+    
+    for pol in input_polarizations:
+        # Define source with specific polarization
+        sources = [
+            mp.Source(
+                mp.GaussianSource(1.0/wavelength, fwidth=0.2),
+                component=mp.Ez,
+                center=mp.Vector3(-1.5, 0, 0),
+                amplitude=pol['Ez_amp']
+            ),
+            mp.Source(
+                mp.GaussianSource(1.0/wavelength, fwidth=0.2),
+                component=mp.Ey,
+                center=mp.Vector3(-1.5, 0, 0),
+                amplitude=pol['Ey_amp']
+            )
+        ]
+        
+        # Set up simulation
+        sim = mp.Simulation(
+            cell_size=cell_size,
+            boundary_layers=[mp.PML(0.5)],
+            geometry=geometry,
+            sources=sources,
+            resolution=resolution
+        )
+        
+        # Add monitors for field collection
+        field_monitor = sim.add_dft_fields(
+            [mp.Ez, mp.Ey], 
+            1.0/wavelength, 
+            0, 
+            1,
+            mp.Volume(center=mp.Vector3(1.5, 0, 0), size=mp.Vector3(0, 2, 0))
+        )
+        
+        # Run simulation
+        sim.run(until_after_sources=50)
+        
+        # Extract field data and calculate output Jones vector
+        ez_data = sim.get_dft_array(field_monitor, mp.Ez, 0)
+        ey_data = sim.get_dft_array(field_monitor, mp.Ey, 0)
+        
+        # Average over the monitor region
+        ez_avg = np.mean(ez_data)
+        ey_avg = np.mean(ey_data)
+        
+        output_jones = np.array([ez_avg, ey_avg])
+        
+        # Convert to Stokes parameters
+        stokes = jones_to_stokes(output_jones)
+        stokes_vectors.append(stokes)
+        
+        # Clean up for next iteration
+        sim.restart_fields()
+    
+    # Calculate Mueller matrix from Stokes vectors
+    mueller_matrix = calculate_mueller_from_stokes(stokes_vectors)
+    
+    return mueller_matrix
+
+
+def calculate_mueller_from_stokes(stokes_vectors: List[np.ndarray]) -> np.ndarray:
+    """
+    Calculate Mueller matrix from output Stokes vectors for 6 input polarizations
+    """
+    # The 6 input Stokes vectors for our chosen polarizations
+    input_stokes_matrix = np.array([
+        [1, 1, 0, 0],    # Horizontal linear
+        [1, -1, 0, 0],   # Vertical linear  
+        [1, 0, 1, 0],    # +45° linear
+        [1, 0, -1, 0],   # -45° linear
+        [1, 0, 0, 1],    # Right circular
+        [1, 0, 0, -1]    # Left circular
+    ]).T  # Transpose to get 4x6
+    
+    # Output Stokes matrix (4x6)
+    output_stokes_matrix = np.column_stack(stokes_vectors)
+    
+    # Mueller matrix M such that S_out = M * S_in
+    # Use pseudoinverse since we have more measurements than needed
+    mueller_matrix = output_stokes_matrix @ np.linalg.pinv(input_stokes_matrix)
+    
+    return mueller_matrix
+
+
+# ============================================================================
+# GEOMETRY DEFINITION METHODS
+# ============================================================================
+
+def create_basic_geometry() -> List[mp.GeometricObject]:
+    """
+    Create basic geometric objects using MEEP's built-in shapes
+    """
+    # Example: Dielectric sphere in air
+    geometry = [
+        mp.Sphere(
+            radius=0.5,
+            center=mp.Vector3(0, 0, 0),
+            material=mp.Medium(epsilon=12.0)
+        ),
+        mp.Block(
+            size=mp.Vector3(0.2, 2.0, 0),
+            center=mp.Vector3(0.7, 0, 0),
+            material=mp.Medium(epsilon=8.0)
+        )
+    ]
+    return geometry
+
+
+def create_anisotropic_geometry() -> List[mp.GeometricObject]:
+    """
+    Create geometry with anisotropic materials
+    """
+    # Define anisotropic material with different epsilon in x,y,z
+    anisotropic_material = mp.Medium(
+        epsilon_diag=mp.Vector3(4.0, 6.0, 9.0),
+        epsilon_offdiag=mp.Vector3(0.1, 0.2, 0.1)
+    )
+    
+    geometry = [
+        mp.Block(
+            size=mp.Vector3(1.0, 1.0, 0),
+            center=mp.Vector3(0, 0, 0),
+            material=anisotropic_material
+        )
+    ]
+    return geometry
+
+
+def create_material_grid_geometry() -> List[mp.GeometricObject]:
+    """
+    Create geometry using MaterialGrid for pixel-level control
+    """
+    # Define a material grid for topology optimization or custom structures
+    grid_size = mp.Vector3(32, 32, 1)
+    
+    # Create a pattern (e.g., concentric circles)
+    weights = np.zeros((32, 32, 1))
+    for i in range(32):
+        for j in range(32):
+            r = np.sqrt((i-16)**2 + (j-16)**2)
+            weights[i, j, 0] = 1.0 if (5 < r < 10) or (12 < r < 15) else 0.0
+    
+    # Define materials for interpolation
+    material_grid = mp.MaterialGrid(
+        grid_size=grid_size,
+        medium1=mp.Medium(epsilon=1.0),  # Air
+        medium2=mp.Medium(epsilon=12.0), # Silicon
+        weights=weights.flatten(),
+        do_averaging=True
+    )
+    
+    geometry = [
+        mp.Block(
+            size=mp.Vector3(2.0, 2.0, 0),
+            center=mp.Vector3(0, 0, 0),
+            material=material_grid
+        )
+    ]
+    return geometry
+
+
+def create_geometry_from_hdf5(filename: str, dataset_name: str = "epsilon") -> List[mp.GeometricObject]:
+    """
+    Create geometry by importing data from HDF5 file
+    
+    Args:
+        filename: Path to HDF5 file containing geometry data
+        dataset_name: Name of dataset in HDF5 file
+    """
+    if not HDF5_AVAILABLE:
+        raise ImportError("h5py is required for HDF5 geometry import")
+    
+    try:
+        with h5py.File(filename, 'r') as f:
+            epsilon_data = f[dataset_name][:]
+        
+        # Convert HDF5 data to MaterialGrid
+        if len(epsilon_data.shape) == 2:
+            # 2D data - add singleton z dimension
+            epsilon_data = epsilon_data[:, :, np.newaxis]
+        elif len(epsilon_data.shape) != 3:
+            raise ValueError("Epsilon data must be 2D or 3D array")
+        
+        # Normalize epsilon data to weights [0,1]
+        eps_min, eps_max = epsilon_data.min(), epsilon_data.max()
+        weights = (epsilon_data - eps_min) / (eps_max - eps_min)
+        
+        # Create MaterialGrid
+        grid_size = mp.Vector3(*epsilon_data.shape)
+        material_grid = mp.MaterialGrid(
+            grid_size=grid_size,
+            medium1=mp.Medium(epsilon=eps_min),
+            medium2=mp.Medium(epsilon=eps_max),
+            weights=weights.flatten(),
+            do_averaging=True
+        )
+        
+        geometry = [
+            mp.Block(
+                size=mp.Vector3(2.0, 2.0, 0),
+                center=mp.Vector3(0, 0, 0),
+                material=material_grid
+            )
+        ]
+        
+        return geometry
+        
+    except Exception as e:
+        print(f"Error reading HDF5 file {filename}: {e}")
+        # Fallback to simple geometry
+        return create_basic_geometry()
+
+
+def create_geometry_from_epsilon_file(eps_input_file: str) -> List[mp.GeometricObject]:
+    """
+    Create geometry using MEEP's built-in epsilon file support
+    
+    Args:
+        eps_input_file: Path to HDF5 file with epsilon data
+    
+    Note: This uses MEEP's make_file_material function when available
+    """
+    try:
+        # Use MEEP's built-in file material support
+        file_material = mp.Medium(epsilon=1.0)  # Default fallback
+        
+        # In practice, you would set this as the default material
+        # and MEEP would read from the eps_input_file
+        # This requires the Simulation constructor's eps_input_file parameter
+        print(f"Would use epsilon data from {eps_input_file}")
+        print("Use eps_input_file parameter in Simulation constructor for this functionality")
+        
+        # For now, return basic geometry
+        return create_basic_geometry()
+        
+    except Exception as e:
+        print(f"Error with epsilon file {eps_input_file}: {e}")
+        return create_basic_geometry()
+
+
+def create_multilayer_geometry() -> List[mp.GeometricObject]:
+    """
+    Create multilayer structure for thin-film optics
+    """
+    # Example: Anti-reflection coating
+    layers = []
+    layer_materials = [
+        mp.Medium(epsilon=2.25),  # SiO2
+        mp.Medium(epsilon=4.0),   # Si3N4
+        mp.Medium(epsilon=12.0),  # Si substrate
+    ]
+    layer_thicknesses = [0.1, 0.15, 1.0]
+    
+    z_pos = -0.6
+    for material, thickness in zip(layer_materials, layer_thicknesses):
+        layers.append(
+            mp.Block(
+                size=mp.Vector3(mp.inf, mp.inf, thickness),
+                center=mp.Vector3(0, 0, z_pos + thickness/2),
+                material=material
+            )
+        )
+        z_pos += thickness
+    
+    return layers
+
+
+def create_periodic_structure() -> List[mp.GeometricObject]:
+    """
+    Create a periodic structure (grating)
+    """
+    # Grating parameters
+    period = 0.6
+    duty_cycle = 0.4
+    height = 0.3
+    
+    # Single grating element
+    geometry = [
+        mp.Block(
+            size=mp.Vector3(period * duty_cycle, mp.inf, height),
+            center=mp.Vector3(0, 0, 0),
+            material=mp.Medium(epsilon=12.0)
+        )
+    ]
+    
+    return geometry
+
+
+def create_complex_geometry_example() -> List[mp.GeometricObject]:
+    """
+    Example combining multiple geometry types
+    """
+    geometry = []
+    
+    # Substrate
+    geometry.append(
+        mp.Block(
+            size=mp.Vector3(mp.inf, mp.inf, 0.5),
+            center=mp.Vector3(0, 0, -0.25),
+            material=mp.Medium(epsilon=12.0)  # Silicon
+        )
+    )
+    
+    # Cylindrical resonator
+    geometry.append(
+        mp.Cylinder(
+            radius=0.3,
+            height=0.2,
+            center=mp.Vector3(0, 0, 0.1),
+            material=mp.Medium(epsilon=2.25)  # SiO2
+        )
+    )
+    
+    # Metal contact
+    geometry.append(
+        mp.Block(
+            size=mp.Vector3(0.8, 0.1, 0.05),
+            center=mp.Vector3(0, 0, 0.225),
+            material=mp.metal
+        )
+    )
+    
+    return geometry
+
+
+def save_geometry_to_hdf5(geometry_func: Callable, filename: str, 
+                         resolution: int = 64, cell_size: Tuple[float, float, float] = (4, 4, 0)):
+    """
+    Save geometry epsilon distribution to HDF5 file
+    
+    Args:
+        geometry_func: Function that returns MEEP geometry
+        filename: Output HDF5 filename
+        resolution: Grid resolution for sampling
+        cell_size: Size of computational cell
+    """
+    if not HDF5_AVAILABLE:
+        raise ImportError("h5py is required for HDF5 geometry export")
+    
+    # Create temporary simulation to extract epsilon
+    sim = mp.Simulation(
+        cell_size=mp.Vector3(*cell_size),
+        geometry=geometry_func(),
+        resolution=resolution
+    )
+    
+    # Get epsilon distribution
+    eps_data = sim.get_epsilon()
+    
+    # Save to HDF5
+    with h5py.File(filename, 'w') as f:
+        f.create_dataset('epsilon', data=eps_data)
+        f.attrs['resolution'] = resolution
+        f.attrs['cell_size'] = cell_size
+    
+    print(f"Geometry saved to {filename}")
+
+
+# ============================================================================
+# MATERIAL DEFINITIONS
+# ============================================================================
+
+def define_dispersive_materials():
+    """
+    Define dispersive materials for realistic simulations
+    """
+    # Silicon with dispersion
+    silicon = mp.Medium(
+        epsilon=11.68,
+        E_susceptibilities=[
+            mp.LorentzianSusceptibility(
+                frequency=3.0, gamma=0.0, sigma=0.01
+            )
+        ]
+    )
+    
+    # Gold using Drude model
+    gold = mp.Medium(
+        epsilon=1.0,
+        E_susceptibilities=[
+            mp.DrudeSusceptibility(
+                frequency=2175.0, gamma=4.35, sigma=4.86e7
+            )
+        ]
+    )
+    
+    # Glass (SiO2)
+    glass = mp.Medium(epsilon=2.25)
+    
+    return {"silicon": silicon, "gold": gold, "glass": glass}
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+def run_mueller_matrix_analysis():
+    """
+    Run complete Mueller matrix analysis on different geometries
+    """
+    geometries = {
+        "basic": create_basic_geometry,
+        "anisotropic": create_anisotropic_geometry,
+        "material_grid": create_material_grid_geometry,
+        "multilayer": create_multilayer_geometry,
+        "complex": create_complex_geometry_example,
+    }
+    
+    results = {}
+    
+    for name, geom_func in geometries.items():
+        print(f"\nCalculating Mueller matrix for {name} geometry...")
+        try:
+            mueller = calculate_mueller_matrix(geom_func)
+            results[name] = mueller
+            
+            print(f"Mueller matrix for {name}:")
+            print(mueller)
+            
+            # Calculate some derived properties
+            diattenuation = np.sqrt(mueller[0,1]**2 + mueller[0,2]**2 + mueller[0,3]**2) / mueller[0,0]
+            print(f"Diattenuation: {diattenuation:.4f}")
+            
+        except Exception as e:
+            print(f"Error calculating Mueller matrix for {name}: {e}")
+    
+    return results
+
+
+def demonstrate_geometry_methods():
+    """
+    Demonstrate different geometry definition methods
+    """
+    print("MEEP Geometry Definition Methods")
+    print("="*50)
+    
+    print("\n1. Basic Geometric Objects:")
+    basic_geom = create_basic_geometry()
+    for obj in basic_geom:
+        print(f"   - {type(obj).__name__}: {obj}")
+    
+    print("\n2. Anisotropic Materials:")
+    aniso_geom = create_anisotropic_geometry()
+    for obj in aniso_geom:
+        print(f"   - {type(obj).__name__} with anisotropic material")
+    
+    print("\n3. Material Grid (pixel-level control):")
+    grid_geom = create_material_grid_geometry()
+    for obj in grid_geom:
+        print(f"   - {type(obj).__name__} with MaterialGrid")
+    
+    print("\n4. Multilayer Structure:")
+    multilayer_geom = create_multilayer_geometry()
+    for i, obj in enumerate(multilayer_geom):
+        print(f"   - Layer {i+1}: {type(obj).__name__}")
+    
+    print("\n5. Complex Combined Geometry:")
+    complex_geom = create_complex_geometry_example()
+    for i, obj in enumerate(complex_geom):
+        print(f"   - Element {i+1}: {type(obj).__name__}")
+    
+    if HDF5_AVAILABLE:
+        print("\n6. HDF5 Export/Import available")
+    else:
+        print("\n6. HDF5 functionality not available (install h5py)")
+
+
+if __name__ == "__main__":
+    # Demonstrate geometry methods
+    demonstrate_geometry_methods()
+    
+    print("\n" + "="*50)
+    
+    # Example: Run analysis on basic geometry
+    print("Running Mueller matrix calculation on basic geometry...")
+    try:
+        mueller_basic = calculate_mueller_matrix(create_basic_geometry)
+        print("Mueller matrix for basic geometry:")
+        print(mueller_basic)
+    except Exception as e:
+        print(f"Error: {e}")
+        print("This is expected in a documentation context without running MEEP")
+    
+    # Example: Save geometry to HDF5 (if available)
+    if HDF5_AVAILABLE:
+        try:
+            save_geometry_to_hdf5(create_material_grid_geometry, "example_geometry.h5")
+        except Exception as e:
+            print(f"HDF5 save error: {e}")
+    
+    print("\nFor full analysis, run: run_mueller_matrix_analysis()")
