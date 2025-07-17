@@ -72,6 +72,7 @@ def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) 
     Returns:
         4x4 Mueller matrix
     """
+    print("Starting Mueller matrix calculation...")
     
     # Define the six input polarization states needed for Mueller matrix
     input_polarizations = [
@@ -94,9 +95,14 @@ def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) 
     resolution = 32
     frequency = 1.0/wavelength
     
+    print(f"Cell size: {cell_size}")
+    print(f"Resolution: {resolution}")
+    print(f"Frequency: {frequency}")
+    
     # Get geometry from function
     try:
         geometry = geometry_func()
+        print(f"✓ Geometry created: {len(geometry)} objects")
     except Exception as e:
         print(f"Error creating geometry: {e}")
         geometry = []  # Use empty geometry as fallback
@@ -145,6 +151,8 @@ def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) 
                     )
                 )
             
+            print(f"    Setting up simulation with {len(sources)} sources...")
+            
             # Set up simulation with proper parameters
             sim = mp.Simulation(
                 cell_size=cell_size,
@@ -156,22 +164,32 @@ def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) 
                 default_material=mp.Medium(epsilon=1.0)  # Air background
             )
             
+            print(f"    Simulation initialized successfully")
+            
             # Add monitors for field collection at output plane
             monitor_center = mp.Vector3(1.5, 0, 0)
             monitor_size = mp.Vector3(0, 2, 0)
+            
+            print(f"    Adding DFT monitor at {monitor_center} with size {monitor_size}")
             
             field_monitor = sim.add_dft_fields(
                 [mp.Ez, mp.Ey], 
                 frequency, 
                 0, 
                 1,
-                mp.Volume(center=monitor_center, size=monitor_size)
+                center=monitor_center,
+                size=monitor_size
             )
             
+            print(f"    DFT monitor added successfully")
+            
             # Run simulation with progress feedback
+            print(f"    Running simulation...")
             sim.run(until_after_sources=mp.stop_when_fields_decayed(
                 dt=50, c=mp.Ez, pt=monitor_center, decay_by=1e-3
             ))
+            
+            print(f"    Simulation completed, extracting field data...")
             
             # Extract field data and calculate output Jones vector
             ez_data = sim.get_dft_array(field_monitor, mp.Ez, 0)
@@ -187,8 +205,10 @@ def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) 
             stokes = jones_to_stokes(output_jones)
             stokes_vectors.append(stokes)
             
+            print(f"    ✓ Polarization {i+1} completed: Ez={ez_avg:.3e}, Ey={ey_avg:.3e}")
+            
         except Exception as e:
-            print(f"    Error in polarization {i+1}: {e}")
+            print(f"    ✗ Error in polarization {i+1}: {e}")
             # Use dummy Stokes vector for failed simulation
             stokes_vectors.append(np.array([1.0, 0.0, 0.0, 0.0]))
     
@@ -197,6 +217,7 @@ def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) 
     # Calculate Mueller matrix from Stokes vectors
     try:
         mueller_matrix = calculate_mueller_from_stokes(stokes_vectors)
+        print("✓ Mueller matrix calculation successful")
     except Exception as e:
         print(f"Error calculating Mueller matrix: {e}")
         # Return identity matrix as fallback
