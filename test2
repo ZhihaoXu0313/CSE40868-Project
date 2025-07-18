@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+Demonstration: MEEP Geometry vs. Epsilon Grid Reality
+
+This script demonstrates that MEEP doesn't work with exact geometric shapes but 
+rather converts them to epsilon (dielectric constant) distributions on a 
+discretized Yee grid.
+"""
+
+import meep as mp
+import numpy as np
+import matplotlib.pyplot as plt
+
+def demonstrate_geometry_discretization():
+    """
+    Demonstrate how MEEP converts geometric objects to epsilon grids
+    """
+    print("=== MEEP Geometry-to-Grid Demonstration ===\n")
+    
+    # Create a simple geometry: sphere in vacuum
+    resolution = 20
+    cell_size = mp.Vector3(4, 4, 0)  # 2D simulation
+    
+    # Define a perfect sphere
+    sphere_radius = 1.0
+    sphere_material = mp.Medium(epsilon=12.0)  # Silicon
+    
+    geometry = [
+        mp.Sphere(
+            radius=sphere_radius,
+            center=mp.Vector3(0, 0, 0),
+            material=sphere_material
+        )
+    ]
+    
+    # Create simulation
+    sim = mp.Simulation(
+        cell_size=cell_size,
+        geometry=geometry,
+        resolution=resolution,
+        eps_averaging=True,  # Enable subpixel smoothing
+        force_complex_fields=False
+    )
+    
+    # Initialize the simulation (this is where geometry gets converted to grid)
+    print("Converting geometry to epsilon grid...")
+    sim.init_sim()
+    
+    # Get epsilon values from the grid
+    print("Extracting epsilon values from discretized grid...")
+    
+    # Sample epsilon at different points
+    sample_points = []
+    epsilon_values = []
+    
+    # Sample along a line through the sphere
+    x_samples = np.linspace(-2, 2, 50)
+    y_center = 0.0
+    
+    for x in x_samples:
+        point = mp.Vector3(x, y_center, 0)
+        # Get epsilon at this point from the discretized grid
+        eps_val = sim.get_epsilon_point(point)
+        sample_points.append(x)
+        epsilon_values.append(eps_val)
+    
+    # Theoretical (exact) epsilon for comparison
+    theoretical_eps = []
+    for x in x_samples:
+        distance_from_center = abs(x)
+        if distance_from_center <= sphere_radius:
+            theoretical_eps.append(12.0)  # Inside sphere
+        else:
+            theoretical_eps.append(1.0)   # Outside sphere (vacuum)
+    
+    # Create visualization
+    plt.figure(figsize=(12, 8))
+    
+    # Plot 1: Epsilon profile comparison
+    plt.subplot(2, 2, 1)
+    plt.plot(sample_points, theoretical_eps, 'b-', linewidth=2, label='Theoretical (exact geometry)')
+    plt.plot(sample_points, epsilon_values, 'r.-', markersize=6, label='MEEP discretized grid')
+    plt.xlabel('x position')
+    plt.ylabel('Epsilon')
+    plt.title('Epsilon Profile: Theory vs. MEEP Grid')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Difference between theory and grid
+    plt.subplot(2, 2, 2)
+    diff = np.array(epsilon_values) - np.array(theoretical_eps)
+    plt.plot(sample_points, diff, 'g.-', markersize=4)
+    plt.xlabel('x position')
+    plt.ylabel('Epsilon difference')
+    plt.title('Grid vs. Theory Difference')
+    plt.grid(True, alpha=0.3)
+    
+    # Print key findings
+    print("\n=== KEY FINDINGS ===")
+    print(f"Resolution: {resolution} pixels per unit length")
+    print(f"Sphere radius: {sphere_radius}")
+    print(f"Theoretical epsilon inside: 12.0")
+    print(f"Theoretical epsilon outside: 1.0")
+    
+    # Find interface region
+    interface_indices = np.where(np.abs(diff) > 0.01)[0]
+    if len(interface_indices) > 0:
+        interface_width = len(interface_indices) / resolution
+        print(f"Interface width in grid: ~{interface_width:.3f} grid units")
+        print(f"Max epsilon in interface: {np.max(epsilon_values):.3f}")
+        print(f"Min epsilon in interface: {np.min(epsilon_values):.3f}")
+    
+    # Show 2D epsilon map
+    plt.subplot(2, 1, 2)
+    
+    # Get 2D epsilon array
+    center = mp.Vector3(0, 0, 0)
+    size = mp.Vector3(4, 4, 0)
+    eps_data = sim.get_epsilon_slice(center, size)
+    
+    plt.imshow(eps_data, extent=[-2, 2, -2, 2], origin='lower', cmap='viridis')
+    plt.colorbar(label='Epsilon')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.title('2D Epsilon Distribution on MEEP Grid')
+    
+    # Add circle overlay for theoretical boundary
+    circle = plt.Circle((0, 0), sphere_radius, fill=False, color='red', linewidth=2)
+    plt.gca().add_patch(circle)
+    
+    plt.tight_layout()
+    plt.savefig('/Users/zhihaoxu/Documents/working/MEEP/epsilon_grid_demo.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    print(f"\nVisualization saved as: epsilon_grid_demo.png")
+    
+    # Demonstrate different resolution effects
+    print("\n=== RESOLUTION DEPENDENCE ===")
+    resolutions = [10, 20, 40]
+    
+    for res in resolutions:
+        sim_res = mp.Simulation(
+            cell_size=cell_size,
+            geometry=geometry,
+            resolution=res,
+            eps_averaging=True
+        )
+        sim_res.init_sim()
+        
+        # Sample epsilon at interface
+        interface_point = mp.Vector3(sphere_radius, 0, 0)
+        eps_at_interface = sim_res.get_epsilon_point(interface_point)
+        
+        print(f"Resolution {res}: epsilon at interface = {eps_at_interface:.4f}")
+    
+    print("\n=== CONCLUSION ===")
+    print("MEEP converts geometric objects to epsilon distributions on a Yee grid.")
+    print("- Higher resolution = finer grid = better approximation of geometry")
+    print("- Subpixel smoothing creates intermediate epsilon values at boundaries")
+    print("- The actual simulation works with these grid values, not exact shapes")
+    print("- This is why numerical dispersion and grid effects matter in FDTD!")
+
+def demonstrate_material_sampling():
+    """
+    Show how MEEP samples materials at different grid points
+    """
+    print("\n=== MATERIAL SAMPLING DEMONSTRATION ===")
+    
+    # Create a simple geometry with two materials
+    resolution = 10
+    cell_size = mp.Vector3(6, 4, 0)
+    
+    geometry = [
+        mp.Block(
+            center=mp.Vector3(-1, 0, 0),
+            size=mp.Vector3(2, 2, mp.inf),
+            material=mp.Medium(epsilon=4.0)  # Material 1
+        ),
+        mp.Block(
+            center=mp.Vector3(1, 0, 0),  
+            size=mp.Vector3(2, 2, mp.inf),
+            material=mp.Medium(epsilon=9.0)  # Material 2
+        )
+    ]
+    
+    sim = mp.Simulation(
+        cell_size=cell_size,
+        geometry=geometry,
+        resolution=resolution,
+        eps_averaging=True
+    )
+    
+    sim.init_sim()
+    
+    # Sample epsilon across the interface
+    x_samples = np.linspace(-3, 3, 61)
+    y_center = 0.0
+    
+    print("Sampling epsilon across material interface:")
+    print("x position | epsilon value | material interpretation")
+    print("-" * 50)
+    
+    for x in x_samples[::5]:  # Sample every 5th point for clarity
+        point = mp.Vector3(x, y_center, 0)
+        eps_val = sim.get_epsilon_point(point)
+        
+        if eps_val < 2:
+            material = "vacuum"
+        elif eps_val < 6:
+            material = "material 1 region"
+        elif eps_val < 7:
+            material = "interface/transition"
+        else:
+            material = "material 2 region"
+            
+        print(f"{x:8.2f}   | {eps_val:11.4f} | {material}")
+
+if __name__ == "__main__":
+    demonstrate_geometry_discretization()
+    demonstrate_material_sampling()
