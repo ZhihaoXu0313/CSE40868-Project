@@ -113,12 +113,16 @@ def demonstrate_geometry_discretization():
     # Show 2D epsilon map
     plt.subplot(2, 1, 2)
     
-    # Get 2D epsilon array
-    center = mp.Vector3(0, 0, 0)
-    size = mp.Vector3(4, 4, 0)
-    eps_data = sim.get_epsilon_slice(center, size)
+    # Create 2D grid for epsilon visualization
+    x_2d = np.linspace(-2, 2, 81)
+    y_2d = np.linspace(-2, 2, 81)
+    z_2d = np.array([0])  # 2D simulation, so z=0
     
-    plt.imshow(eps_data, extent=[-2, 2, -2, 2], origin='lower', cmap='viridis')
+    # Get 2D epsilon array using get_epsilon_grid
+    eps_data = sim.get_epsilon_grid(x_2d, y_2d, z_2d)
+    eps_data = np.real(eps_data.squeeze())  # Remove singleton dimensions and take real part
+    
+    plt.imshow(eps_data.T, extent=[-2, 2, -2, 2], origin='lower', cmap='viridis')
     plt.colorbar(label='Epsilon')
     plt.xlabel('x')
     plt.ylabel('y')
