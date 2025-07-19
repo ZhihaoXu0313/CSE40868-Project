@@ -1,0 +1,93 @@
+import vtk
+import vtk.util.numpy_support
+import numpy as np
+
+def cuboid_to_voxel(cuboid_list, grid_dimensions=(100, 100, 100), bounds=None):
+    """
+    Convert list of cuboids to a voxel grid with solid volume filling.
+    
+    Parameters:
+    - cuboid_list: List of cuboids defines by [[x_min, y_min, z_min, x_max, y_max, z_max], ...].
+    - grid_dimensions: Tuple of (nx, ny, nz) for voxel grid resolution.
+    - bounds: Optional custom bounds for the output grid
+
+    Returns:
+    - numpy array of voxel grid (1 = inside cuboid, 0 = outside)
+    """
+    if not cuboid_list:
+        return np.zeros(grid_dimensions)
+    
+    # Calculate bounds if not provided
+    if bounds is None:
+        all_coords = np.array(cuboid_list)
+        bounds = [
+            all_coords[:, 0].min(),  # x_min
+            all_coords[:, 3].max(),  # x_max
+            all_coords[:, 1].min(),  # y_min
+            all_coords[:, 4].max(),  # y_max
+            all_coords[:, 2].min(),  # z_min
+            all_coords[:, 5].max()   # z_max
+        ]
+    
+    # Create VTK image data (voxel grid)
+    image_data = vtk.vtkImageData()
+    image_data.SetDimensions(grid_dimensions)
+    image_data.SetOrigin(bounds[0], bounds[2], bounds[4])
+    image_data.SetSpacing(
+        (bounds[1] - bounds[0]) / grid_dimensions[0],
+        (bounds[3] - bounds[2]) / grid_dimensions[1],
+        (bounds[5] - bounds[4]) / grid_dimensions[2]
+    )
+    
+    # Initialize scalar array
+    scalars = vtk.vtkIntArray()
+    scalars.SetNumberOfTuples(image_data.GetNumberOfPoints())
+    scalars.Fill(0)
+    image_data.GetPointData().SetScalars(scalars)
+    
+    # Create polydata for all cuboids
+    append_filter = vtk.vtkAppendPolyData()
+    
+    for cuboid in cuboid_list:
+        x_min, y_min, z_min, x_max, y_max, z_max = cuboid
+        
+        # Create cube source
+        cube = vtk.vtkCubeSource()
+        cube.SetBounds(x_min, x_max, y_min, y_max, z_min, z_max)
+        cube.Update()
+        
+        append_filter.AddInputData(cube.GetOutput())
+    
+    append_filter.Update()
+    
+    # Create stencil from polydata for solid volume filling
+    pol2stenc = vtk.vtkPolyDataToImageStencil()
+    pol2stenc.SetInputData(append_filter.GetOutput())
+    pol2stenc.SetOutputOrigin(image_data.GetOrigin())
+    pol2stenc.SetOutputSpacing(image_data.GetSpacing())
+    pol2stenc.SetOutputWholeExtent(image_data.GetExtent())
+    pol2stenc.SetTolerance(0.0)
+    pol2stenc.Update()
+    
+    # Create filled image for solid volume
+    filled_image = vtk.vtkImageData()
+    filled_image.DeepCopy(image_data)
+    filled_scalars = vtk.vtkIntArray()
+    filled_scalars.SetNumberOfTuples(filled_image.GetNumberOfPoints())
+    filled_scalars.Fill(1)
+    filled_image.GetPointData().SetScalars(filled_scalars)
+    
+    # Apply stencil to create solid volumes
+    stencil_filter = vtk.vtkImageStencil()
+    stencil_filter.SetInputData(filled_image)
+    stencil_filter.SetStencilData(pol2stenc.GetOutput())
+    stencil_filter.ReverseStencilOff()  # Keep inside, set outside to background
+    stencil_filter.SetBackgroundValue(0)
+    stencil_filter.Update()
+    
+    # Convert VTK image to numpy array
+    vtk_array = stencil_filter.GetOutput().GetPointData().GetScalars()
+    numpy_array = vtk.util.numpy_support.vtk_to_numpy(vtk_array)
+    voxel_grid = numpy_array.reshape(grid_dimensions, order='F')
+    
+    return voxel_grid
