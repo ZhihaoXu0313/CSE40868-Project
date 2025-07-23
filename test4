@@ -1,0 +1,357 @@
+"""
+SciPy optimizer wrapper for compatibility with existing algorithms.
+
+Provides a bridge between the JAX-based framework and SciPy optimization
+algorithms, enabling the use of mature optimization methods.
+"""
+
+import jax
+import jax.numpy as jnp
+from typing import Dict, List, Tuple, Optional, Any, Callable
+import numpy as np
+from scipy import optimize
+
+from .base import OptimizationAlgorithm
+
+
+class ScipyOptimizer(OptimizationAlgorithm):
+    """
+    Wrapper for SciPy optimization algorithms.
+    
+    Enables the use of SciPy optimizers within the JAX-based framework
+    while maintaining compatibility with automatic differentiation.
+    """
+    
+    def __init__(self,
+                 parameter_set,
+                 cost_function,
+                 config,
+                 method: str = 'L-BFGS-B',
+                 options: Optional[Dict[str, Any]] = None,
+                 **kwargs):
+        """
+        Initialize SciPy optimizer wrapper.
+        
+        Args:
+            method: SciPy optimization method name
+            options: Options dictionary for SciPy optimizer
+        """
+        self.scipy_method = method
+        self.scipy_options = options or {}
+        
+        # Default options based on method
+        if method == 'L-BFGS-B':
+            default_options = {
+                'ftol': config.tolerance,
+                'gtol': config.gradient_tolerance,
+                'maxiter': config.max_iterations,
+                'disp': config.verbose
+            }
+        elif method in ['SLSQP', 'trust-constr']:
+            default_options = {
+                'ftol': config.tolerance,
+                'maxiter': config.max_iterations,
+                'disp': config.verbose
+            }
+        else:
+            default_options = {
+                'maxiter': config.max_iterations,
+                'disp': config.verbose
+            }
+        
+        # Merge with user options
+        for key, value in default_options.items():
+            if key not in self.scipy_options:
+                self.scipy_options[key] = value
+        
+        super().__init__(parameter_set, cost_function, config, **kwargs)
+    
+    def requires_gradients(self) -> bool:
+        """Check if method requires gradients."""
+        gradient_methods = [
+            'BFGS', 'L-BFGS-B', 'CG', 'Newton-CG', 'TNC', 'SLSQP', 'trust-constr'
+        ]
+        return self.scipy_method in gradient_methods
+    
+    def _initialize_algorithm(self, **kwargs):
+        """Initialize SciPy-specific state."""
+        # Create bounds for SciPy
+        self.scipy_bounds = list(zip(
+            self.parameter_set.bounds.lower,
+            self.parameter_set.bounds.upper
+        ))
+        
+        # Callback function to track progress
+        self.callback_history = []
+    
+    def _scipy_callback(self, x):
+        """Callback function for SciPy optimization."""
+        # Convert to JAX array
+        params = jnp.array(x)
+        
+        # Evaluate cost function
+        if self.requires_gradients():
+            cost, gradient = self.value_and_grad_fn(params)
+            gradient_norm = float(jnp.linalg.norm(gradient))
+        else:
+            cost = self.cost_function(params)
+            gradient_norm = float('inf')
+        
+        # Store in history
+        self.callback_history.append({
+            'iteration': len(self.callback_history),
+            'cost': float(cost),
+            'parameters': np.array(params),
+            'gradient_norm': gradient_norm,
+            'timestamp': __import__('time').time()
+        })
+        
+        # Print progress
+        if self.config.verbose and len(self.callback_history) % 10 == 1:
+            print(f"Iter {len(self.callback_history):4d}: Cost = {cost:.6e}, "
+                  f"Grad Norm = {gradient_norm:.3e}")
+    
+    def _create_scipy_functions(self) -> Tuple[Callable, Optional[Callable]]:
+        """Create SciPy-compatible objective and gradient functions."""
+        
+        def objective(x):
+            """Objective function for SciPy."""
+            params = jnp.array(x)
+            cost = self.cost_function(params)
+            return float(cost)
+        
+        if self.requires_gradients():
+            def gradient(x):
+                """Gradient function for SciPy."""
+                params = jnp.array(x)
+                grad = self.gradient_fn(params)
+                return np.array(grad)
+            
+            def objective_and_gradient(x):
+                """Combined objective and gradient function."""
+                params = jnp.array(x)
+                cost, grad = self.value_and_grad_fn(params)
+                return float(cost), np.array(grad)
+            
+            return objective_and_gradient, gradient
+        else:
+            return objective, None
+    
+    def optimize(self):
+        """Run SciPy optimization."""
+        # Create SciPy-compatible functions
+        if self.requires_gradients():
+            objective_and_grad, _ = self._create_scipy_functions()
+            
+            # Use combined function for efficiency
+            def scipy_objective(x):
+                cost, grad = objective_and_grad(x)
+                return cost
+            
+            def scipy_gradient(x):
+                cost, grad = objective_and_grad(x)
+                return grad
+            
+            jac = scipy_gradient
+        else:
+            objective_and_grad, _ = self._create_scipy_functions()
+            scipy_objective = objective_and_grad
+            jac = None
+        
+        # Set up optimization
+        x0 = np.array(self.parameter_set.initial_values)
+        
+        # Choose appropriate bounds handling
+        if self.scipy_method in ['L-BFGS-B', 'TNC', 'SLSQP', 'trust-constr']:
+            bounds = self.scipy_bounds
+        else:
+            bounds = None
+            # For methods without bounds, we'll clip parameters in the callback
+        
+        # Run optimization
+        start_time = __import__('time').time()
+        
+        try:
+            result = optimize.minimize(
+                fun=scipy_objective,
+                x0=x0,
+                method=self.scipy_method,
+                jac=jac,
+                bounds=bounds,
+                callback=self._scipy_callback,
+                options=self.scipy_options
+            )
+            
+            optimization_time = __import__('time').time() - start_time
+            
+            # Create our result format
+            from ..core.optimizer import OptimizationResult
+            
+            return OptimizationResult(
+                success=result.success,
+                final_cost=float(result.fun),
+                optimal_parameters=jnp.array(result.x),
+                n_iterations=result.nit if hasattr(result, 'nit') else len(self.callback_history),
+                n_function_evaluations=result.nfev,
+                optimization_time=optimization_time,
+                convergence_history=self.callback_history,
+                final_gradient_norm=float(jnp.linalg.norm(result.jac)) if hasattr(result, 'jac') and result.jac is not None else None,
+                message=result.message
+            )
+            
+        except Exception as e:
+            optimization_time = __import__('time').time() - start_time
+            
+            from ..core.optimizer import OptimizationResult
+            
+            return OptimizationResult(
+                success=False,
+                final_cost=float('inf'),
+                optimal_parameters=self.parameter_set.initial_values,
+                n_iterations=len(self.callback_history),
+                n_function_evaluations=self.cost_function.call_count,
+                optimization_time=optimization_time,
+                convergence_history=self.callback_history,
+                message=f"SciPy optimization failed: {str(e)}"
+            )
+    
+    def _step(self) -> bool:
+        """Not used for SciPy wrapper - optimization is done in optimize()."""
+        raise NotImplementedError("SciPy wrapper uses optimize() method directly")
+
+
+class ScipyGlobalOptimizer(ScipyOptimizer):
+    """
+    Wrapper for SciPy global optimization algorithms.
+    
+    Provides access to global optimization methods like differential evolution,
+    dual annealing, and SHGO.
+    """
+    
+    def __init__(self,
+                 parameter_set,
+                 cost_function,
+                 config,
+                 method: str = 'differential_evolution',
+                 **kwargs):
+        """
+        Initialize SciPy global optimizer.
+        
+        Args:
+            method: Global optimization method ('differential_evolution', 'dual_annealing', 'shgo')
+        """
+        # Global methods don't typically use gradients
+        self.global_method = method
+        
+        # Set up method-specific options
+        if method == 'differential_evolution':
+            default_options = {
+                'maxiter': config.max_iterations,
+                'popsize': 15,
+                'mutation': 0.7,
+                'recombination': 0.7,
+                'seed': 42,
+                'disp': config.verbose
+            }
+        elif method == 'dual_annealing':
+            default_options = {
+                'maxiter': config.max_iterations,
+                'initial_temp': 5230.0,
+                'restart_temp_ratio': 2e-5,
+                'visit': 2.62,
+                'accept': -5.0,
+                'seed': 42,
+                'no_local_search': False
+            }
+        elif method == 'shgo':
+            default_options = {
+                'n': config.max_iterations,
+                'iters': 5,
+                'minimizer_kwargs': {'method': 'SLSQP'}
+            }
+        else:
+            default_options = {}
+        
+        # Merge with user options
+        options = kwargs.get('options', {})
+        for key, value in default_options.items():
+            if key not in options:
+                options[key] = value
+        
+        super().__init__(parameter_set, cost_function, config, 
+                        method=method, options=options)
+    
+    def requires_gradients(self) -> bool:
+        """Global methods typically don't require gradients."""
+        return False
+    
+    def optimize(self):
+        """Run SciPy global optimization."""
+        # Create objective function
+        def objective(x):
+            params = jnp.array(x)
+            cost = self.cost_function(params)
+            return float(cost)
+        
+        # Set up bounds (required for global methods)
+        bounds = self.scipy_bounds
+        
+        # Run global optimization
+        start_time = __import__('time').time()
+        
+        try:
+            if self.global_method == 'differential_evolution':
+                result = optimize.differential_evolution(
+                    func=objective,
+                    bounds=bounds,
+                    callback=self._scipy_callback,
+                    **self.scipy_options
+                )
+            elif self.global_method == 'dual_annealing':
+                result = optimize.dual_annealing(
+                    func=objective,
+                    bounds=bounds,
+                    callback=self._scipy_callback,
+                    **self.scipy_options
+                )
+            elif self.global_method == 'shgo':
+                result = optimize.shgo(
+                    func=objective,
+                    bounds=bounds,
+                    callback=self._scipy_callback,
+                    **self.scipy_options
+                )
+            else:
+                raise ValueError(f"Unknown global method: {self.global_method}")
+            
+            optimization_time = __import__('time').time() - start_time
+            
+            # Create result
+            from ..core.optimizer import OptimizationResult
+            
+            return OptimizationResult(
+                success=result.success,
+                final_cost=float(result.fun),
+                optimal_parameters=jnp.array(result.x),
+                n_iterations=result.nit if hasattr(result, 'nit') else len(self.callback_history),
+                n_function_evaluations=result.nfev,
+                optimization_time=optimization_time,
+                convergence_history=self.callback_history,
+                message=result.message
+            )
+            
+        except Exception as e:
+            optimization_time = __import__('time').time() - start_time
+            
+            from ..core.optimizer import OptimizationResult
+            
+            return OptimizationResult(
+                success=False,
+                final_cost=float('inf'),
+                optimal_parameters=self.parameter_set.initial_values,
+                n_iterations=len(self.callback_history),
+                n_function_evaluations=self.cost_function.call_count,
+                optimization_time=optimization_time,
+                convergence_history=self.callback_history,
+                message=f"SciPy global optimization failed: {str(e)}"
+            )
