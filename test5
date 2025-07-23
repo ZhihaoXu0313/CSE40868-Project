@@ -1,0 +1,357 @@
+"""
+Gradient-based optimization algorithms using JAX.
+
+Implements modern gradient-based optimizers like Adam and L-BFGS
+that can efficiently use JAX automatic differentiation.
+"""
+
+import jax
+import jax.numpy as jnp
+from typing import Dict, List, Tuple, Optional, Any
+import numpy as np
+from dataclasses import dataclass
+
+from .base import OptimizationAlgorithm
+
+
+@dataclass
+class AdamState:
+    """State for Adam optimizer."""
+    m: jnp.ndarray  # First moment estimate
+    v: jnp.ndarray  # Second moment estimate
+    t: int = 0      # Time step
+
+
+class AdamOptimizer(OptimizationAlgorithm):
+    """
+    Adam optimizer with JAX automatic differentiation.
+    
+    Implements the Adam optimization algorithm (Kingma & Ba, 2014)
+    with support for parameter bounds and adaptive learning rates.
+    """
+    
+    def __init__(self, 
+                 parameter_set,
+                 cost_function, 
+                 config,
+                 learning_rate: float = 0.001,
+                 beta1: float = 0.9,
+                 beta2: float = 0.999,
+                 epsilon: float = 1e-8,
+                 adaptive_lr: bool = True,
+                 lr_decay: float = 0.95,
+                 **kwargs):
+        """
+        Initialize Adam optimizer.
+        
+        Args:
+            learning_rate: Initial learning rate
+            beta1: Exponential decay rate for first moment estimates
+            beta2: Exponential decay rate for second moment estimates
+            epsilon: Small constant for numerical stability
+            adaptive_lr: Whether to use adaptive learning rate
+            lr_decay: Learning rate decay factor
+        """
+        self.learning_rate = learning_rate
+        self.initial_lr = learning_rate
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.adaptive_lr = adaptive_lr
+        self.lr_decay = lr_decay
+        
+        super().__init__(parameter_set, cost_function, config, **kwargs)
+    
+    def requires_gradients(self) -> bool:
+        """Adam requires gradients."""
+        return True
+    
+    def _initialize_algorithm(self, **kwargs):
+        """Initialize Adam-specific state."""
+        n_params = self.parameter_set.ndim
+        self.adam_state = AdamState(
+            m=jnp.zeros(n_params),
+            v=jnp.zeros(n_params),
+            t=0
+        )
+    
+    def _step(self) -> bool:
+        """Perform one Adam optimization step."""
+        # Update time step
+        self.adam_state.t += 1
+        
+        # Compute cost and gradient
+        cost, gradient = self.value_and_grad_fn(self.state.parameters)
+        
+        # Update biased first moment estimate
+        self.adam_state.m = (self.beta1 * self.adam_state.m + 
+                            (1 - self.beta1) * gradient)
+        
+        # Update biased second raw moment estimate
+        self.adam_state.v = (self.beta2 * self.adam_state.v + 
+                            (1 - self.beta2) * gradient ** 2)
+        
+        # Compute bias-corrected first moment estimate
+        m_hat = self.adam_state.m / (1 - self.beta1 ** self.adam_state.t)
+        
+        # Compute bias-corrected second raw moment estimate
+        v_hat = self.adam_state.v / (1 - self.beta2 ** self.adam_state.t)
+        
+        # Adaptive learning rate
+        if self.adaptive_lr and self.state.iteration > 0:
+            # Reduce learning rate if cost increased
+            if cost > self.state.cost:
+                self.learning_rate *= self.lr_decay
+            elif cost < self.state.cost * 0.95:  # Good progress
+                self.learning_rate = min(self.learning_rate * 1.05, self.initial_lr * 2)
+        
+        # Update parameters
+        update = self.learning_rate * m_hat / (jnp.sqrt(v_hat) + self.epsilon)
+        new_parameters = self.state.parameters - update
+        
+        # Apply bounds
+        new_parameters = self._ensure_bounds(new_parameters)
+        
+        # Update state
+        self.state.parameters = new_parameters
+        self.state.cost = cost
+        self.state.gradient = gradient
+        self.state.gradient_norm = jnp.linalg.norm(gradient)
+        
+        return True
+
+
+class LBFGSOptimizer(OptimizationAlgorithm):
+    """
+    Limited-memory BFGS optimizer with JAX automatic differentiation.
+    
+    Implements L-BFGS algorithm with support for parameter bounds
+    and efficient memory usage for high-dimensional problems.
+    """
+    
+    def __init__(self,
+                 parameter_set,
+                 cost_function,
+                 config,
+                 memory_size: int = 10,
+                 initial_hessian_scale: float = 1.0,
+                 max_line_search_iterations: int = 20,
+                 **kwargs):
+        """
+        Initialize L-BFGS optimizer.
+        
+        Args:
+            memory_size: Number of previous iterations to store
+            initial_hessian_scale: Initial Hessian approximation scale
+            max_line_search_iterations: Maximum line search iterations
+        """
+        self.memory_size = memory_size
+        self.initial_hessian_scale = initial_hessian_scale
+        self.max_line_search_iterations = max_line_search_iterations
+        
+        super().__init__(parameter_set, cost_function, config, **kwargs)
+    
+    def requires_gradients(self) -> bool:
+        """L-BFGS requires gradients."""
+        return True
+    
+    def _initialize_algorithm(self, **kwargs):
+        """Initialize L-BFGS specific state."""
+        self.s_history = []  # Parameter changes
+        self.y_history = []  # Gradient changes
+        self.rho_history = []  # 1 / (y^T s)
+        
+        self.previous_gradient = None
+    
+    def _step(self) -> bool:
+        """Perform one L-BFGS optimization step."""
+        # Compute cost and gradient
+        cost, gradient = self.value_and_grad_fn(self.state.parameters)
+        
+        # Update histories
+        if self.previous_gradient is not None:
+            s = self.state.parameters - self.previous_parameters
+            y = gradient - self.previous_gradient
+            
+            # Check curvature condition
+            sy = jnp.dot(s, y)
+            if sy > 1e-10:  # Positive curvature
+                self.s_history.append(s)
+                self.y_history.append(y)
+                self.rho_history.append(1.0 / sy)
+                
+                # Maintain memory limit
+                if len(self.s_history) > self.memory_size:
+                    self.s_history.pop(0)
+                    self.y_history.pop(0)
+                    self.rho_history.pop(0)
+        
+        # Compute search direction using two-loop recursion
+        q = gradient.copy()
+        alphas = []
+        
+        # First loop (backward)
+        for i in range(len(self.s_history) - 1, -1, -1):
+            alpha = self.rho_history[i] * jnp.dot(self.s_history[i], q)
+            q = q - alpha * self.y_history[i]
+            alphas.append(alpha)
+        
+        alphas.reverse()
+        
+        # Apply initial Hessian approximation
+        if len(self.y_history) > 0:
+            # Use last y^T s / y^T y as scaling
+            last_y = self.y_history[-1]
+            last_s = self.s_history[-1]
+            gamma = jnp.dot(last_s, last_y) / jnp.dot(last_y, last_y)
+            r = gamma * q
+        else:
+            r = self.initial_hessian_scale * q
+        
+        # Second loop (forward)
+        for i in range(len(self.s_history)):
+            beta = self.rho_history[i] * jnp.dot(self.y_history[i], r)
+            r = r + self.s_history[i] * (alphas[i] - beta)
+        
+        search_direction = -r
+        
+        # Line search
+        step_size, new_cost = self._line_search(
+            self.state.parameters, 
+            search_direction,
+            max_iterations=self.max_line_search_iterations
+        )
+        
+        # Update parameters
+        if step_size > 0:
+            new_parameters = self._ensure_bounds(
+                self.state.parameters + step_size * search_direction
+            )
+            
+            # Re-evaluate if parameters were clipped
+            if not jnp.allclose(new_parameters, 
+                               self.state.parameters + step_size * search_direction):
+                new_cost = self.cost_function(new_parameters)
+        else:
+            # Line search failed, try steepest descent
+            step_size = 1e-4
+            new_parameters = self._ensure_bounds(
+                self.state.parameters - step_size * gradient
+            )
+            new_cost = self.cost_function(new_parameters)
+        
+        # Store current state for next iteration
+        self.previous_parameters = self.state.parameters.copy()
+        self.previous_gradient = gradient.copy()
+        
+        # Update state
+        self.state.parameters = new_parameters
+        self.state.cost = new_cost
+        self.state.gradient = gradient
+        self.state.gradient_norm = jnp.linalg.norm(gradient)
+        
+        return True
+
+
+class ConjugateGradientOptimizer(OptimizationAlgorithm):
+    """
+    Nonlinear Conjugate Gradient optimizer with JAX.
+    
+    Implements the Polak-Ribière variant of conjugate gradient
+    with automatic restarts and line search.
+    """
+    
+    def __init__(self,
+                 parameter_set,
+                 cost_function,
+                 config,
+                 restart_interval: Optional[int] = None,
+                 beta_method: str = 'PR',  # 'PR', 'FR', 'HS'
+                 **kwargs):
+        """
+        Initialize Conjugate Gradient optimizer.
+        
+        Args:
+            restart_interval: Iterations between restarts (auto if None)
+            beta_method: Method for computing beta ('PR', 'FR', 'HS')
+        """
+        self.restart_interval = restart_interval or parameter_set.ndim
+        self.beta_method = beta_method
+        
+        super().__init__(parameter_set, cost_function, config, **kwargs)
+    
+    def requires_gradients(self) -> bool:
+        """CG requires gradients."""
+        return True
+    
+    def _initialize_algorithm(self, **kwargs):
+        """Initialize CG-specific state."""
+        self.search_direction = None
+        self.previous_gradient = None
+        self.iterations_since_restart = 0
+    
+    def _step(self) -> bool:
+        """Perform one CG optimization step."""
+        # Compute cost and gradient
+        cost, gradient = self.value_and_grad_fn(self.state.parameters)
+        
+        # First iteration or restart
+        if (self.search_direction is None or 
+            self.iterations_since_restart >= self.restart_interval):
+            
+            self.search_direction = -gradient
+            self.iterations_since_restart = 0
+        else:
+            # Compute beta for conjugate direction
+            if self.beta_method == 'PR':  # Polak-Ribière
+                numerator = jnp.dot(gradient, gradient - self.previous_gradient)
+                denominator = jnp.dot(self.previous_gradient, self.previous_gradient)
+            elif self.beta_method == 'FR':  # Fletcher-Reeves
+                numerator = jnp.dot(gradient, gradient)
+                denominator = jnp.dot(self.previous_gradient, self.previous_gradient)
+            elif self.beta_method == 'HS':  # Hestenes-Stiefel
+                grad_diff = gradient - self.previous_gradient
+                numerator = jnp.dot(gradient, grad_diff)
+                denominator = jnp.dot(self.search_direction, grad_diff)
+            else:
+                raise ValueError(f"Unknown beta method: {self.beta_method}")
+            
+            beta = max(0, numerator / max(denominator, 1e-10))  # Non-negative beta
+            
+            # Update search direction
+            self.search_direction = -gradient + beta * self.search_direction
+        
+        # Line search
+        step_size, new_cost = self._line_search(self.state.parameters, self.search_direction)
+        
+        # Update parameters
+        if step_size > 0:
+            new_parameters = self._ensure_bounds(
+                self.state.parameters + step_size * self.search_direction
+            )
+            
+            # Re-evaluate if parameters were clipped
+            if not jnp.allclose(new_parameters, 
+                               self.state.parameters + step_size * self.search_direction):
+                new_cost = self.cost_function(new_parameters)
+        else:
+            # Line search failed, restart with steepest descent
+            self.search_direction = -gradient
+            step_size = 1e-4
+            new_parameters = self._ensure_bounds(
+                self.state.parameters + step_size * self.search_direction
+            )
+            new_cost = self.cost_function(new_parameters)
+            self.iterations_since_restart = 0
+        
+        # Store gradient for next iteration
+        self.previous_gradient = gradient.copy()
+        self.iterations_since_restart += 1
+        
+        # Update state
+        self.state.parameters = new_parameters
+        self.state.cost = new_cost
+        self.state.gradient = gradient
+        self.state.gradient_norm = jnp.linalg.norm(gradient)
+        
+        return True
