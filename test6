@@ -1,0 +1,485 @@
+"""
+Integrated Voxel-Based Geometry Loader
+
+This module provides a comprehensive class for loading and converting device geometries
+to voxel-based representations, combining device configuration, material properties,
+simulation parameters, and geometry creation functionality.
+"""
+
+import numpy as np
+import h5py
+from typing import Dict, List, Tuple, Optional, Any
+import os
+
+from device import GeometryConfigLoader
+from material import Material, VOID, OXIDE, NITRIDE, SILICON, SIGE
+from simulation import SimulationConfigLoader
+from create_layers import (
+    create_rectangular_layer,
+    create_trapezoidal_layer,
+    create_halfcircle_layer,
+    create_concave_layer
+)
+from conversion import cuboids_to_voxels, cuboids_to_voxels_with_eps
+
+
+class VoxelGeometryLoader:
+    """
+    Integrated class for loading voxel-based geometries from device configurations.
+    
+    This class combines:
+    - Device configuration loading (layers, materials, stack sequences)
+    - Material property management
+    - Simulation parameter handling
+    - Layer geometry creation
+    - Voxel grid conversion
+    """
+    
+    def __init__(self, 
+                 device_config: str = "device_config.yaml",
+                 simulation_config: str = "simulation_config.yaml",
+                 material_database: Optional[Dict[str, Material]] = None):
+        """
+        Initialize the VoxelGeometryLoader.
+        
+        Args:
+            device_config: Path to device configuration YAML file
+            simulation_config: Path to simulation configuration YAML file
+            material_database: Optional custom material database
+        """
+        self.device_loader = GeometryConfigLoader(device_config)
+        self.simulation_loader = SimulationConfigLoader(simulation_config)
+        
+        # Default material database
+        self.material_database = {
+            'VOID': VOID,
+            'OXIDE': OXIDE,
+            'NITRIDE': NITRIDE,
+            'SILICON': SILICON,
+            'SIGE': SIGE
+        }
+        
+        # Update with custom materials if provided
+        if material_database:
+            self.material_database.update(material_database)
+        
+        # Configuration data
+        self.device_loaded = False
+        self.simulation_loaded = False
+        
+        # Geometry data
+        self.voxel_grid = None
+        self.epsilon_grid = None
+        self.layer_stack = []
+        self.total_thickness = 0.0
+        
+        # Grid parameters
+        self.grid_dimensions = None
+        self.grid_bounds = None
+        self.x_pitch = None
+        self.y_pitch = None
+        
+    def load_configurations(self) -> bool:
+        """Load both device and simulation configurations."""
+        device_success = self.device_loader.load_config()
+        simulation_success = self.simulation_loader.load_config()
+        
+        if device_success:
+            self.device_loaded = True
+            print("Device configuration loaded successfully")
+        
+        if simulation_success:
+            self.simulation_loaded = True
+            self._extract_grid_parameters()
+            print("Simulation configuration loaded successfully")
+        
+        return device_success and simulation_success
+    
+    def _extract_grid_parameters(self):
+        """Extract grid parameters from simulation configuration."""
+        if self.simulation_loaded:
+            self.x_pitch = self.simulation_loader.grid.get("X_PITCH", 1.0)
+            self.y_pitch = self.simulation_loader.grid.get("Y_PITCH", 1.0)
+            x_gridpts = self.simulation_loader.grid.get("X_GRIDPTS", 100)
+            y_gridpts = self.simulation_loader.grid.get("Y_GRIDPTS", 100)
+            
+            # Calculate total thickness from device
+            if self.device_loaded:
+                self.total_thickness = self.device_loader.get_total_thickness()
+                # Estimate z grid points based on minimum feature size
+                min_thickness = min(layer['config'].thickness 
+                                   for layer in self.device_loader.expanded_stack_sequence
+                                   if layer['config'])
+                z_gridpts = max(10, int(self.total_thickness / min_thickness * 2))
+            else:
+                z_gridpts = 100
+            
+            self.grid_dimensions = (x_gridpts, y_gridpts, z_gridpts)
+    
+    def create_layer_stack(self, wavelength: float = 500.0) -> List[Dict]:
+        """
+        Create the layer stack with epsilon values at specified wavelength.
+        
+        Args:
+            wavelength: Wavelength in nm for material property calculation
+            
+        Returns:
+            List of layer dictionaries with geometry and material info
+        """
+        if not self.device_loaded:
+            raise RuntimeError("Device configuration not loaded")
+        
+        self.layer_stack = []
+        z_position = 0.0
+        
+        for layer_entry in self.device_loader.expanded_stack_sequence:
+            layer_config = layer_entry['config']
+            if not layer_config:
+                continue
+            
+            # Get material
+            material_name = layer_config.material
+            if material_name not in self.material_database:
+                print(f"Warning: Material {material_name} not found, using VOID")
+                material = VOID
+            else:
+                material = self.material_database[material_name]
+                # Update material properties for this wavelength
+                if hasattr(material, 'get_properties'):
+                    material.get_properties(wavelength)
+            
+            # Create layer geometry based on type
+            layer_info = {
+                'name': layer_entry['layer_name'],
+                'material_name': material_name,
+                'material': material,
+                'epsilon': material.eps_r,
+                'config': layer_config,
+                'z_start': z_position,
+                'z_end': z_position + layer_config.thickness
+            }
+            
+            # Generate geometry based on layer type
+            if layer_config.geometry_type == 'rectangular':
+                layer_info['geometry'] = self._create_rectangular_geometry(layer_config, material.eps_r)
+            elif layer_config.geometry_type == 'trapezoidal':
+                layer_info['geometry'] = self._create_trapezoidal_geometry(layer_config, material.eps_r)
+            elif layer_config.geometry_type == 'halfcircle':
+                layer_info['geometry'] = self._create_halfcircle_geometry(layer_config, material.eps_r)
+            elif layer_config.geometry_type == 'concave':
+                layer_info['geometry'] = self._create_concave_geometry(layer_config, material.eps_r)
+            else:
+                print(f"Warning: Unknown geometry type {layer_config.geometry_type}, using rectangular")
+                layer_info['geometry'] = self._create_rectangular_geometry(layer_config, material.eps_r)
+            
+            self.layer_stack.append(layer_info)
+            z_position += layer_config.thickness
+        
+        return self.layer_stack
+    
+    def _create_rectangular_geometry(self, config, material_eps):
+        """Create rectangular layer geometry."""
+        width = config.width or self.x_pitch
+        return create_rectangular_layer(config.thickness, width, material_eps)
+    
+    def _create_trapezoidal_geometry(self, config, material_eps):
+        """Create trapezoidal layer geometry."""
+        top_width = config.top_width or config.width or self.x_pitch * 0.5
+        bottom_width = config.bottom_width or config.width or self.x_pitch * 0.8
+        return create_trapezoidal_layer(
+            config.thickness, 
+            config.num_sublayers, 
+            top_width, 
+            bottom_width, 
+            material_eps
+        )
+    
+    def _create_halfcircle_geometry(self, config, material_eps):
+        """Create half-circle layer geometry."""
+        radius = config.radius or (config.width or self.x_pitch) / 2
+        return create_halfcircle_layer(
+            radius, 
+            config.thickness, 
+            config.num_sublayers, 
+            material_eps
+        )
+    
+    def _create_concave_geometry(self, config, material_eps):
+        """Create concave layer geometry."""
+        max_width = config.max_width or config.width or self.x_pitch * 0.8
+        min_width = config.min_width or max_width * 0.5
+        return create_concave_layer(
+            config.thickness, 
+            max_width, 
+            min_width, 
+            material_eps, 
+            config.num_sublayers
+        )
+    
+    def convert_to_cuboids(self) -> List[Tuple[List[float], Dict]]:
+        """
+        Convert layer stack to cuboid representation.
+        
+        Returns:
+            List of (cuboid_bounds, material_info) tuples
+        """
+        if not self.layer_stack:
+            raise RuntimeError("Layer stack not created. Call create_layer_stack() first.")
+        
+        cuboid_material_list = []
+        
+        for layer in self.layer_stack:
+            config = layer['config']
+            material_info = {
+                'epsilon': layer['epsilon'],
+                'name': layer['material_name']
+            }
+            
+            # Determine layer bounds
+            if config.geometry_type == 'rectangular':
+                width = config.width or self.x_pitch
+                x_center = self.x_pitch / 2
+                y_center = self.y_pitch / 2
+                
+                cuboid_bounds = [
+                    x_center - width/2,  # x_min
+                    y_center - self.y_pitch/2,  # y_min
+                    layer['z_start'],  # z_min
+                    x_center + width/2,  # x_max
+                    y_center + self.y_pitch/2,  # y_max
+                    layer['z_end']  # z_max
+                ]
+                
+                cuboid_material_list.append((cuboid_bounds, material_info))
+            
+            else:
+                # For complex geometries, create multiple thin cuboids
+                num_slices = config.num_sublayers
+                slice_thickness = config.thickness / num_slices
+                
+                for i in range(num_slices):
+                    z_start = layer['z_start'] + i * slice_thickness
+                    z_end = z_start + slice_thickness
+                    
+                    # Calculate width for this slice based on geometry
+                    relative_height = (i + 0.5) / num_slices
+                    
+                    if config.geometry_type == 'trapezoidal':
+                        top_width = config.top_width or self.x_pitch * 0.5
+                        bottom_width = config.bottom_width or self.x_pitch * 0.8
+                        width = top_width + relative_height * (bottom_width - top_width)
+                    
+                    elif config.geometry_type == 'halfcircle':
+                        radius = config.radius or self.x_pitch / 4
+                        h = relative_height * radius
+                        width = min(2.0 * np.sqrt(2 * radius * h - h ** 2), self.x_pitch)
+                    
+                    elif config.geometry_type == 'concave':
+                        max_width = config.max_width or self.x_pitch * 0.8
+                        min_width = config.min_width or max_width * 0.5
+                        width_diff = max_width - min_width
+                        angle = relative_height * np.pi
+                        sin_value = np.sin(angle)
+                        width = max_width - (width_diff * sin_value)
+                    
+                    else:
+                        width = config.width or self.x_pitch
+                    
+                    x_center = self.x_pitch / 2
+                    y_center = self.y_pitch / 2
+                    
+                    cuboid_bounds = [
+                        x_center - width/2,  # x_min
+                        y_center - self.y_pitch/2,  # y_min
+                        z_start,  # z_min
+                        x_center + width/2,  # x_max
+                        y_center + self.y_pitch/2,  # y_max
+                        z_end  # z_max
+                    ]
+                    
+                    cuboid_material_list.append((cuboid_bounds, material_info))
+        
+        return cuboid_material_list
+    
+    def generate_voxel_grids(self, 
+                           grid_dimensions: Optional[Tuple[int, int, int]] = None,
+                           bounds: Optional[List[float]] = None,
+                           background_eps: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate voxel and epsilon grids from the layer stack.
+        
+        Args:
+            grid_dimensions: Optional override for grid dimensions
+            bounds: Optional custom bounds [x_min, x_max, y_min, y_max, z_min, z_max]
+            background_eps: Background epsilon value
+            
+        Returns:
+            Tuple of (voxel_grid, epsilon_grid)
+        """
+        cuboid_material_list = self.convert_to_cuboids()
+        
+        # Use provided dimensions or defaults
+        dims = grid_dimensions or self.grid_dimensions
+        if dims is None:
+            dims = (100, 100, 100)
+        
+        # Use provided bounds or calculate from geometry
+        if bounds is None:
+            bounds = [0, self.x_pitch, 0, self.y_pitch, 0, self.total_thickness]
+        
+        # Convert to voxels with epsilon values
+        self.voxel_grid, self.epsilon_grid = cuboids_to_voxels_with_eps(
+            cuboid_material_list,
+            grid_dimensions=dims,
+            bounds=bounds,
+            background_eps=background_eps
+        )
+        
+        return self.voxel_grid, self.epsilon_grid
+    
+    def save_voxel_data(self, filename: str = "geometry_data.h5"):
+        """
+        Save voxel and epsilon grids to HDF5 file.
+        
+        Args:
+            filename: Output filename
+        """
+        if self.voxel_grid is None or self.epsilon_grid is None:
+            raise RuntimeError("Voxel grids not generated. Call generate_voxel_grids() first.")
+        
+        with h5py.File(filename, 'w') as f:
+            # Save grids
+            f.create_dataset('voxel_grid', data=self.voxel_grid)
+            f.create_dataset('epsilon_grid', data=self.epsilon_grid)
+            
+            # Save metadata
+            f.attrs['total_thickness'] = self.total_thickness
+            f.attrs['x_pitch'] = self.x_pitch
+            f.attrs['y_pitch'] = self.y_pitch
+            f.attrs['grid_dimensions'] = self.grid_dimensions
+            
+            # Save layer information
+            layer_group = f.create_group('layers')
+            for i, layer in enumerate(self.layer_stack):
+                layer_subgroup = layer_group.create_group(f'layer_{i}')
+                layer_subgroup.attrs['name'] = layer['name']
+                layer_subgroup.attrs['material_name'] = layer['material_name']
+                layer_subgroup.attrs['epsilon_real'] = np.real(layer['epsilon'])
+                layer_subgroup.attrs['epsilon_imag'] = np.imag(layer['epsilon'])
+                layer_subgroup.attrs['z_start'] = layer['z_start']
+                layer_subgroup.attrs['z_end'] = layer['z_end']
+                layer_subgroup.attrs['thickness'] = layer['config'].thickness
+                layer_subgroup.attrs['geometry_type'] = layer['config'].geometry_type
+        
+        print(f"Voxel data saved to {filename}")
+    
+    def load_voxel_data(self, filename: str = "geometry_data.h5"):
+        """
+        Load voxel and epsilon grids from HDF5 file.
+        
+        Args:
+            filename: Input filename
+        """
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"File {filename} not found")
+        
+        with h5py.File(filename, 'r') as f:
+            self.voxel_grid = f['voxel_grid'][:]
+            self.epsilon_grid = f['epsilon_grid'][:]
+            
+            # Load metadata
+            self.total_thickness = f.attrs['total_thickness']
+            self.x_pitch = f.attrs['x_pitch']
+            self.y_pitch = f.attrs['y_pitch']
+            self.grid_dimensions = tuple(f.attrs['grid_dimensions'])
+            
+            print(f"Voxel data loaded from {filename}")
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """Get a summary of the loaded geometry."""
+        summary = {
+            'device_loaded': self.device_loaded,
+            'simulation_loaded': self.simulation_loaded,
+            'total_thickness': self.total_thickness,
+            'grid_dimensions': self.grid_dimensions,
+            'x_pitch': self.x_pitch,
+            'y_pitch': self.y_pitch,
+            'num_layers': len(self.layer_stack),
+            'materials_used': list(set(layer['material_name'] for layer in self.layer_stack)),
+            'has_voxel_grid': self.voxel_grid is not None,
+            'has_epsilon_grid': self.epsilon_grid is not None
+        }
+        
+        if self.device_loaded:
+            summary.update(self.device_loader.get_stack_summary())
+        
+        return summary
+    
+    def visualize_cross_section(self, axis: str = 'z', position: int = None):
+        """
+        Visualize a cross-section of the epsilon grid.
+        
+        Args:
+            axis: Axis for cross-section ('x', 'y', or 'z')
+            position: Position along the axis (defaults to middle)
+        """
+        if self.epsilon_grid is None:
+            raise RuntimeError("Epsilon grid not generated")
+        
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("Matplotlib not available for visualization")
+            return
+        
+        if position is None:
+            position = self.epsilon_grid.shape[{'x': 0, 'y': 1, 'z': 2}[axis]] // 2
+        
+        if axis == 'z':
+            cross_section = self.epsilon_grid[:, :, position]
+            plt.title(f'Cross-section at z={position}')
+            plt.xlabel('X')
+            plt.ylabel('Y')
+        elif axis == 'y':
+            cross_section = self.epsilon_grid[:, position, :]
+            plt.title(f'Cross-section at y={position}')
+            plt.xlabel('X')
+            plt.ylabel('Z')
+        elif axis == 'x':
+            cross_section = self.epsilon_grid[position, :, :]
+            plt.title(f'Cross-section at x={position}')
+            plt.xlabel('Y')
+            plt.ylabel('Z')
+        else:
+            raise ValueError("Axis must be 'x', 'y', or 'z'")
+        
+        plt.imshow(np.real(cross_section), cmap='viridis', aspect='auto')
+        plt.colorbar(label='Real(epsilon)')
+        plt.show()
+
+
+if __name__ == "__main__":
+    # Example usage
+    loader = VoxelGeometryLoader()
+    
+    if loader.load_configurations():
+        print("Configurations loaded successfully")
+        
+        # Create layer stack at 500nm wavelength
+        layer_stack = loader.create_layer_stack(wavelength=500.0)
+        print(f"Created layer stack with {len(layer_stack)} layers")
+        
+        # Generate voxel grids
+        voxel_grid, epsilon_grid = loader.generate_voxel_grids()
+        print(f"Generated voxel grids with shape {voxel_grid.shape}")
+        
+        # Save data
+        loader.save_voxel_data("example_geometry.h5")
+        
+        # Print summary
+        summary = loader.get_summary()
+        print("\nGeometry Summary:")
+        for key, value in summary.items():
+            print(f"  {key}: {value}")
+    else:
+        print("Failed to load configurations")
