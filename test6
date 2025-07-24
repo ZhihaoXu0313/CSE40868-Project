@@ -1,28 +1,3 @@
-"""
-Integrated Voxel-Based Geometry Loader
-
-This module provides a comprehensive class for loading and converting device geometries
-to voxel-based representations, combining device configuration, material properties,
-simulation parameters, and geometry creation functionality.
-"""
-
-import numpy as np
-import h5py
-from typing import Dict, List, Tuple, Optional, Any
-import os
-
-from device import GeometryConfigLoader
-from material import Material, VOID, OXIDE, NITRIDE, SILICON, SIGE
-from simulation import SimulationConfigLoader
-from create_layers import (
-    create_rectangular_layer,
-    create_trapezoidal_layer,
-    create_halfcircle_layer,
-    create_concave_layer
-)
-from conversion import cuboids_to_voxels, cuboids_to_voxels_with_eps
-
-
 class VoxelGeometryLoader:
     """
     Integrated class for loading voxel-based geometries from device configurations.
@@ -90,16 +65,27 @@ class VoxelGeometryLoader:
         
         if simulation_success:
             self.simulation_loaded = True
-            self._extract_grid_parameters()
             print("Simulation configuration loaded successfully")
+        else:
+            print("Warning: Simulation configuration failed to load, using defaults")
         
-        return device_success and simulation_success
+        # Always extract grid parameters (will use defaults if simulation config failed)
+        self._extract_grid_parameters()
+        
+        return device_success  # Only require device config to be successful
     
     def _extract_grid_parameters(self):
         """Extract grid parameters from simulation configuration."""
-        if self.simulation_loaded:
-            self.x_pitch = self.simulation_loader.grid.get("X_PITCH", 1.0)
-            self.y_pitch = self.simulation_loader.grid.get("Y_PITCH", 1.0)
+        # Set default values first
+        self.x_pitch = 1000.0  # Default 1000 nm
+        self.y_pitch = 1000.0  # Default 1000 nm
+        x_gridpts = 100
+        y_gridpts = 100
+        z_gridpts = 100
+        
+        if self.simulation_loaded and hasattr(self.simulation_loader, 'grid') and self.simulation_loader.grid:
+            self.x_pitch = self.simulation_loader.grid.get("X_PITCH", 1000.0)
+            self.y_pitch = self.simulation_loader.grid.get("Y_PITCH", 1000.0)
             x_gridpts = self.simulation_loader.grid.get("X_GRIDPTS", 100)
             y_gridpts = self.simulation_loader.grid.get("Y_GRIDPTS", 100)
             
@@ -107,14 +93,23 @@ class VoxelGeometryLoader:
             if self.device_loaded:
                 self.total_thickness = self.device_loader.get_total_thickness()
                 # Estimate z grid points based on minimum feature size
-                min_thickness = min(layer['config'].thickness 
-                                   for layer in self.device_loader.expanded_stack_sequence
-                                   if layer['config'])
-                z_gridpts = max(10, int(self.total_thickness / min_thickness * 2))
+                if self.device_loader.expanded_stack_sequence:
+                    min_thickness = min(layer['config'].thickness 
+                                       for layer in self.device_loader.expanded_stack_sequence
+                                       if layer['config'])
+                    z_gridpts = max(10, int(self.total_thickness / min_thickness * 2))
+                else:
+                    z_gridpts = 100
             else:
                 z_gridpts = 100
-            
-            self.grid_dimensions = (x_gridpts, y_gridpts, z_gridpts)
+        else:
+            print("Warning: Simulation grid parameters not found, using defaults")
+            if self.device_loaded:
+                self.total_thickness = self.device_loader.get_total_thickness()
+            else:
+                self.total_thickness = 200.0  # Default thickness
+        
+        self.grid_dimensions = (x_gridpts, y_gridpts, z_gridpts)
     
     def create_layer_stack(self, wavelength: float = 500.0) -> List[Dict]:
         """
@@ -179,13 +174,17 @@ class VoxelGeometryLoader:
     
     def _create_rectangular_geometry(self, config, material_eps):
         """Create rectangular layer geometry."""
-        width = config.width or self.x_pitch
+        # Ensure pitch is available
+        pitch = self.x_pitch or 1000.0
+        width = config.width or pitch
         return create_rectangular_layer(config.thickness, width, material_eps)
     
     def _create_trapezoidal_geometry(self, config, material_eps):
         """Create trapezoidal layer geometry."""
-        top_width = config.top_width or config.width or self.x_pitch * 0.5
-        bottom_width = config.bottom_width or config.width or self.x_pitch * 0.8
+        # Ensure pitch is available
+        pitch = self.x_pitch or 1000.0
+        top_width = config.top_width or config.width or pitch * 0.5
+        bottom_width = config.bottom_width or config.width or pitch * 0.8
         return create_trapezoidal_layer(
             config.thickness, 
             config.num_sublayers, 
@@ -196,7 +195,9 @@ class VoxelGeometryLoader:
     
     def _create_halfcircle_geometry(self, config, material_eps):
         """Create half-circle layer geometry."""
-        radius = config.radius or (config.width or self.x_pitch) / 2
+        # Ensure pitch is available
+        pitch = self.x_pitch or 1000.0
+        radius = config.radius or (config.width or pitch) / 2
         return create_halfcircle_layer(
             radius, 
             config.thickness, 
@@ -206,7 +207,9 @@ class VoxelGeometryLoader:
     
     def _create_concave_geometry(self, config, material_eps):
         """Create concave layer geometry."""
-        max_width = config.max_width or config.width or self.x_pitch * 0.8
+        # Ensure pitch is available
+        pitch = self.x_pitch or 1000.0
+        max_width = config.max_width or config.width or pitch * 0.8
         min_width = config.min_width or max_width * 0.5
         return create_concave_layer(
             config.thickness, 
@@ -225,6 +228,12 @@ class VoxelGeometryLoader:
         """
         if not self.layer_stack:
             raise RuntimeError("Layer stack not created. Call create_layer_stack() first.")
+        
+        # Ensure pitch values are valid
+        if self.x_pitch is None or self.y_pitch is None:
+            print("Warning: Pitch values not set, using defaults")
+            self.x_pitch = self.x_pitch or 1000.0
+            self.y_pitch = self.y_pitch or 1000.0
         
         cuboid_material_list = []
         
@@ -325,7 +334,11 @@ class VoxelGeometryLoader:
         
         # Use provided bounds or calculate from geometry
         if bounds is None:
-            bounds = [0, self.x_pitch, 0, self.y_pitch, 0, self.total_thickness]
+            # Ensure pitch values are available
+            x_pitch = self.x_pitch or 1000.0
+            y_pitch = self.y_pitch or 1000.0
+            total_thickness = self.total_thickness or 200.0
+            bounds = [0, x_pitch, 0, y_pitch, 0, total_thickness]
         
         # Convert to voxels with epsilon values
         self.voxel_grid, self.epsilon_grid = cuboids_to_voxels_with_eps(
