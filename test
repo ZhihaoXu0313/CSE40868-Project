@@ -1,715 +1,251 @@
+#!/usr/bin/env python3
 """
-Comprehensive MEEP Geometry Definition and Mueller Matrix Calculation Example
+Demonstration script comparing LayerGeometryLoader and VoxelGeometryLoader
 
-This module demonstrates:
-1. Mueller matrix calculation for FDTD simulations
-2. Comprehensive geometry definition methods in MEEP
-3. HDF5-based geometry import capabilities (when available)
-4. Material grid definitions for complex structures
+This script shows how both loaders work with the same device_config.yaml but provide
+different outputs:
+- LayerGeometryLoader: Individual layer epsilon volumes for analysis
+- VoxelGeometryLoader: Combined voxel grids for simulation
 """
 
-import meep as mp
+from layer_geometry_loader import LayerGeometryLoader
+from voxel_geometry_loader import VoxelGeometryLoader
 import numpy as np
-import math
-from typing import Callable, List, Optional, Tuple, Union
-
-# Try to import h5py if available for HDF5 geometry support
-try:
-    import h5py
-    HDF5_AVAILABLE = True
-except ImportError:
-    HDF5_AVAILABLE = False
-    print("Warning: h5py not available. HDF5 geometry import will not work.")
 
 
-def jones_to_stokes(jones_vector: np.ndarray) -> np.ndarray:
-    """
-    Convert Jones vector to Stokes parameters
+def demo_layer_geometry_loader():
+    """Demonstrate LayerGeometryLoader capabilities."""
+    print("\n=== LayerGeometryLoader Demo ===")
     
-    Args:
-        jones_vector: Complex 2D Jones vector [Ex, Ey]
+    # Initialize with debug output
+    loader = LayerGeometryLoader(debug=True)
     
-    Returns:
-        Stokes vector [S0, S1, S2, S3]
-    """
-    Ex, Ey = jones_vector
+    # Load configurations
+    if not loader.load_configurations():
+        print("✗ Failed to load configurations")
+        return
     
-    S0 = np.abs(Ex)**2 + np.abs(Ey)**2
-    S1 = np.abs(Ex)**2 - np.abs(Ey)**2
-    S2 = 2 * np.real(Ex * np.conj(Ey))
-    S3 = 2 * np.imag(Ex * np.conj(Ey))
+    # Create layers at 600nm wavelength
+    wavelength = 600.0
+    print(f"\n📡 Creating layers at {wavelength} nm...")
+    if not loader.create_all_layers(wavelength=wavelength):
+        print("✗ Failed to create layers")
+        return
     
-    return np.array([S0, S1, S2, S3])
-
-
-def stokes_to_jones(stokes_vector: np.ndarray) -> np.ndarray:
-    """
-    Convert Stokes parameters to Jones vector (one possible representation)
-    """
-    S0, S1, S2, S3 = stokes_vector
-    
-    # This gives one possible Jones vector for the given Stokes parameters
-    Ex = np.sqrt((S0 + S1) / 2)
-    Ey_mag = np.sqrt((S0 - S1) / 2)
-    
-    if S2 == 0 and S3 == 0:
-        Ey = Ey_mag  # Linear polarization
-    else:
-        phase = np.arctan2(S3, S2) / 2
-        Ey = Ey_mag * np.exp(1j * phase)
-    
-    return np.array([Ex, Ey])
-
-
-def calculate_mueller_matrix(geometry_func: Callable, wavelength: float = 0.54) -> np.ndarray:
-    """
-    Calculate the Mueller matrix for a given optical structure.
-    
-    Args:
-        geometry_func: Function that returns MEEP geometry
-        wavelength: Operating wavelength
-    
-    Returns:
-        4x4 Mueller matrix
-    """
-    print("Starting Mueller matrix calculation...")
-    
-    # Define the six input polarization states needed for Mueller matrix
-    input_polarizations = [
-        # Linear horizontal (1, 0)
-        {'Ez_amp': 1.0, 'Ey_amp': 0.0},
-        # Linear vertical (0, 1) 
-        {'Ez_amp': 0.0, 'Ey_amp': 1.0},
-        # Linear 45° (1, 1)/√2
-        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': 1.0/np.sqrt(2)},
-        # Linear -45° (1, -1)/√2
-        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': -1.0/np.sqrt(2)},
-        # Right circular (1, i)/√2
-        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': 1j/np.sqrt(2)},
-        # Left circular (1, -i)/√2
-        {'Ez_amp': 1.0/np.sqrt(2), 'Ey_amp': -1j/np.sqrt(2)},
-    ]
-    
-    # Define cell parameters - ensure proper 2D setup
-    cell_size = mp.Vector3(4, 4, 0)  # 2D simulation (z=0)
-    resolution = 32
-    frequency = 1.0/wavelength
-    
-    print(f"Cell size: {cell_size}")
-    print(f"Resolution: {resolution}")
-    print(f"Frequency: {frequency}")
-    
-    # Get geometry from function
-    try:
-        geometry = geometry_func()
-        print(f"✓ Geometry created: {len(geometry)} objects")
-    except Exception as e:
-        print(f"Error creating geometry: {e}")
-        geometry = []  # Use empty geometry as fallback
-    
-    stokes_vectors = []
-    
-    print(f"Running Mueller matrix calculation with {len(input_polarizations)} polarizations...")
-    
-    for i, pol in enumerate(input_polarizations):
-        print(f"  Processing polarization {i+1}/{len(input_polarizations)}")
+    # Show individual layer properties
+    print(f"\n📋 Individual Layer Analysis:")
+    for layer_id in loader.get_all_layer_names():
+        metadata = loader.get_layer_metadata(layer_id)
+        eps_volume = loader.get_layer(layer_id)
         
-        try:
-            # Define source with specific polarization
-            sources = []
-            
-            # Only add Ez source if amplitude is non-zero
-            if abs(pol['Ez_amp']) > 1e-10:
-                sources.append(
-                    mp.Source(
-                        mp.GaussianSource(frequency, fwidth=0.2*frequency),
-                        component=mp.Ez,
-                        center=mp.Vector3(-1.5, 0, 0),
-                        amplitude=pol['Ez_amp']
-                    )
-                )
-            
-            # Only add Ey source if amplitude is non-zero  
-            if abs(pol['Ey_amp']) > 1e-10:
-                sources.append(
-                    mp.Source(
-                        mp.GaussianSource(frequency, fwidth=0.2*frequency),
-                        component=mp.Ey,
-                        center=mp.Vector3(-1.5, 0, 0),
-                        amplitude=pol['Ey_amp']
-                    )
-                )
-            
-            # Ensure we have at least one source
-            if not sources:
-                sources.append(
-                    mp.Source(
-                        mp.GaussianSource(frequency, fwidth=0.2*frequency),
-                        component=mp.Ez,
-                        center=mp.Vector3(-1.5, 0, 0),
-                        amplitude=1.0
-                    )
-                )
-            
-            print(f"    Setting up simulation with {len(sources)} sources...")
-            
-            # Set up simulation with proper parameters
-            sim = mp.Simulation(
-                cell_size=cell_size,
-                boundary_layers=[mp.PML(0.5)],
-                geometry=geometry,
-                sources=sources,
-                resolution=resolution,
-                dimensions=2,  # Explicitly set 2D
-                default_material=mp.Medium(epsilon=1.0)  # Air background
-            )
-            
-            print(f"    Simulation initialized successfully")
-            
-            # Add monitors for field collection at output plane
-            monitor_center = mp.Vector3(1.5, 0, 0)
-            monitor_size = mp.Vector3(0, 2, 0)
-            
-            print(f"    Adding DFT monitor at {monitor_center} with size {monitor_size}")
-            
-            field_monitor = sim.add_dft_fields(
-                [mp.Ez, mp.Ey], 
-                frequency, 
-                0, 
-                1,
-                center=monitor_center,
-                size=monitor_size
-            )
-            
-            print(f"    DFT monitor added successfully")
-            
-            # Run simulation with progress feedback
-            print(f"    Running simulation...")
-            sim.run(until_after_sources=mp.stop_when_fields_decayed(
-                dt=50, c=mp.Ez, pt=monitor_center, decay_by=1e-3
-            ))
-            
-            print(f"    Simulation completed, extracting field data...")
-            
-            # Extract field data and calculate output Jones vector
-            ez_data = sim.get_dft_array(field_monitor, mp.Ez, 0)
-            ey_data = sim.get_dft_array(field_monitor, mp.Ey, 0)
-            
-            # Average over the monitor region
-            ez_avg = np.mean(ez_data) if ez_data.size > 0 else 0.0
-            ey_avg = np.mean(ey_data) if ey_data.size > 0 else 0.0
-            
-            output_jones = np.array([ez_avg, ey_avg])
-            
-            # Convert to Stokes parameters
-            stokes = jones_to_stokes(output_jones)
-            stokes_vectors.append(stokes)
-            
-            print(f"    ✓ Polarization {i+1} completed: Ez={ez_avg:.3e}, Ey={ey_avg:.3e}")
-            
-        except Exception as e:
-            print(f"    ✗ Error in polarization {i+1}: {e}")
-            # Use dummy Stokes vector for failed simulation
-            stokes_vectors.append(np.array([1.0, 0.0, 0.0, 0.0]))
+        print(f"\n  Layer: {layer_id}")
+        print(f"    Material: {metadata['material']}")
+        print(f"    Geometry: {metadata['geometry_type']}")
+        print(f"    Thickness: {metadata['total_thickness']:.1f} nm")
+        print(f"    Sublayers: {metadata['num_sublayers']}")
+        print(f"    Epsilon: {metadata['material_eps']:.3f}")
+        print(f"    Volume shape: {eps_volume.shape}")
+        
+        # Show material distribution in volume
+        unique_eps = np.unique(np.round(np.real(eps_volume), 2))
+        print(f"    Epsilon values in volume: {unique_eps}")
     
-    print("Mueller matrix calculation completed.")
+    # Create ordered stack
+    print(f"\n📚 Ordered Stack Sequence:")
+    ordered_stack = loader.create_ordered_stack()
+    total_z = 0
+    for i, layer in enumerate(ordered_stack):
+        print(f"  {i+1}. {layer['layer_name']} ({layer['material']}) - "
+              f"{layer['total_thickness']:.1f} nm @ z={total_z:.1f}-{total_z + layer['total_thickness']:.1f} nm")
+        total_z += layer['total_thickness']
     
-    # Calculate Mueller matrix from Stokes vectors
-    try:
-        mueller_matrix = calculate_mueller_from_stokes(stokes_vectors)
-        print("✓ Mueller matrix calculation successful")
-    except Exception as e:
-        print(f"Error calculating Mueller matrix: {e}")
-        # Return identity matrix as fallback
-        mueller_matrix = np.eye(4)
+    # Stack summary
+    print(f"\n📊 Stack Summary:")
+    summary = loader.get_stack_summary()
+    print(f"  Total thickness: {summary['actual_total_thickness']:.1f} nm")
+    print(f"  Total sublayers: {summary['actual_total_sublayers']}")
+    print(f"  Material distribution: {summary['material_distribution']}")
+    print(f"  Geometry distribution: {summary['geometry_distribution']}")
+    print(f"  Wavelength: {summary['wavelength']} nm")
     
-    return mueller_matrix
+    return loader
 
 
-def calculate_mueller_from_stokes(stokes_vectors: List[np.ndarray]) -> np.ndarray:
-    """
-    Calculate Mueller matrix from output Stokes vectors for 6 input polarizations
-    """
-    # The 6 input Stokes vectors for our chosen polarizations
-    input_stokes_matrix = np.array([
-        [1, 1, 0, 0],    # Horizontal linear
-        [1, -1, 0, 0],   # Vertical linear  
-        [1, 0, 1, 0],    # +45° linear
-        [1, 0, -1, 0],   # -45° linear
-        [1, 0, 0, 1],    # Right circular
-        [1, 0, 0, -1]    # Left circular
-    ]).T  # Transpose to get 4x6
+def demo_voxel_geometry_loader():
+    """Demonstrate VoxelGeometryLoader capabilities."""
+    print("\n=== VoxelGeometryLoader Demo ===")
     
-    # Output Stokes matrix (4x6)
-    output_stokes_matrix = np.column_stack(stokes_vectors)
+    # Initialize 
+    loader = VoxelGeometryLoader()
     
-    # Mueller matrix M such that S_out = M * S_in
-    # Use pseudoinverse since we have more measurements than needed
-    mueller_matrix = output_stokes_matrix @ np.linalg.pinv(input_stokes_matrix)
+    # Load configurations
+    if not loader.load_configurations():
+        print("✗ Failed to load configurations")
+        return
+    print("✓ Configurations loaded")
     
-    return mueller_matrix
-
-
-# ============================================================================
-# GEOMETRY DEFINITION METHODS
-# ============================================================================
-
-def create_basic_geometry() -> List[mp.GeometricObject]:
-    """
-    Create basic geometric objects using MEEP's built-in shapes
-    """
-    # Example: Dielectric sphere in air
-    geometry = [
-        mp.Sphere(
-            radius=0.5,
-            center=mp.Vector3(0, 0, 0),
-            material=mp.Medium(epsilon=12.0)
-        ),
-        mp.Block(
-            size=mp.Vector3(0.2, 2.0, 0),
-            center=mp.Vector3(0.7, 0, 0),
-            material=mp.Medium(epsilon=8.0)
-        )
-    ]
-    return geometry
-
-
-def create_anisotropic_geometry() -> List[mp.GeometricObject]:
-    """
-    Create geometry with anisotropic materials
-    """
-    # Define anisotropic material with different epsilon in x,y,z
-    anisotropic_material = mp.Medium(
-        epsilon_diag=mp.Vector3(4.0, 6.0, 9.0),
-        epsilon_offdiag=mp.Vector3(0.1, 0.2, 0.1)
-    )
+    # Create layer stack at same wavelength
+    wavelength = 600.0
+    layer_stack = loader.create_layer_stack(wavelength=wavelength)
+    print(f"✓ Created layer stack with {len(layer_stack)} layers at {wavelength} nm")
     
-    geometry = [
-        mp.Block(
-            size=mp.Vector3(1.0, 1.0, 0),
-            center=mp.Vector3(0, 0, 0),
-            material=anisotropic_material
-        )
-    ]
-    return geometry
+    # Generate voxel grids
+    grid_dims = (64, 64, 40)
+    voxel_grid, epsilon_grid = loader.generate_voxel_grids(grid_dimensions=grid_dims)
+    print(f"✓ Generated voxel grids: {voxel_grid.shape}")
+    
+    # Show voxel grid properties
+    print(f"\n📐 Voxel Grid Analysis:")
+    print(f"  Grid dimensions: {voxel_grid.shape}")
+    print(f"  Voxel values: {np.unique(voxel_grid)} (0=background, 1=material)")
+    print(f"  Epsilon range (real): {np.min(np.real(epsilon_grid)):.2f} to {np.max(np.real(epsilon_grid)):.2f}")
+    print(f"  Epsilon range (imag): {np.min(np.imag(epsilon_grid)):.2f} to {np.max(np.imag(epsilon_grid)):.2f}")
+    
+    # Show layer-by-layer information
+    print(f"\n📋 Layer Stack Properties:")
+    for i, layer in enumerate(layer_stack):
+        print(f"  {i+1}. {layer['name']} ({layer['material_name']})")
+        print(f"     Z-range: {layer['z_start']:.1f} - {layer['z_end']:.1f} nm")
+        print(f"     Epsilon: {layer['epsilon']:.3f}")
+        print(f"     Geometry: {layer['config'].geometry_type}")
+    
+    return loader
 
 
-def create_material_grid_geometry() -> List[mp.GeometricObject]:
-    """
-    Create geometry using MaterialGrid for pixel-level control
-    """
-    # Define a material grid for topology optimization or custom structures
-    grid_size = mp.Vector3(32, 32, 1)
+def compare_wavelength_dependence():
+    """Compare wavelength-dependent material properties."""
+    print("\n=== Wavelength Dependence Comparison ===")
     
-    # Create a pattern (e.g., concentric circles)
-    weights = np.zeros((32, 32, 1))
-    for i in range(32):
-        for j in range(32):
-            r = np.sqrt((i-16)**2 + (j-16)**2)
-            weights[i, j, 0] = 1.0 if (5 < r < 10) or (12 < r < 15) else 0.0
+    wavelengths = [400, 500, 600, 700, 800]  # nm
     
-    # Define materials for interpolation
-    material_grid = mp.MaterialGrid(
-        grid_size=grid_size,
-        medium1=mp.Medium(epsilon=1.0),  # Air
-        medium2=mp.Medium(epsilon=12.0), # Silicon
-        weights=weights.flatten(),
-        do_averaging=True
-    )
+    # Use LayerGeometryLoader to analyze individual materials
+    loader = LayerGeometryLoader(debug=False)
+    if not loader.load_configurations():
+        return
     
-    geometry = [
-        mp.Block(
-            size=mp.Vector3(2.0, 2.0, 0),
-            center=mp.Vector3(0, 0, 0),
-            material=material_grid
-        )
-    ]
-    return geometry
+    print(f"\n📈 Material Properties vs Wavelength:")
+    print(f"{'Wavelength':<12} {'Silicon':<20} {'Oxide':<20} {'Nitride':<20}")
+    print("-" * 80)
+    
+    for wl in wavelengths:
+        loader.create_all_layers(wavelength=wl)
+        
+        # Get epsilon values for each material
+        materials_eps = {}
+        for layer_id in loader.get_all_layer_names():
+            metadata = loader.get_layer_metadata(layer_id)
+            material = metadata['material']
+            eps = metadata['material_eps']
+            if material not in materials_eps:
+                materials_eps[material] = eps
+        
+        # Format output
+        si_eps = materials_eps.get('SILICON', 0)
+        ox_eps = materials_eps.get('OXIDE', 0)
+        ni_eps = materials_eps.get('NITRIDE', 0)
+        
+        print(f"{wl:<12.0f} {si_eps:<20.3f} {ox_eps:<20.3f} {ni_eps:<20.3f}")
 
 
-def create_geometry_from_hdf5(filename: str, dataset_name: str = "epsilon") -> List[mp.GeometricObject]:
-    """
-    Create geometry by importing data from HDF5 file
+def demo_layer_access_methods():
+    """Demonstrate different ways to access layer data."""
+    print("\n=== Layer Access Methods Demo ===")
     
-    Args:
-        filename: Path to HDF5 file containing geometry data
-        dataset_name: Name of dataset in HDF5 file
-    """
-    if not HDF5_AVAILABLE:
-        raise ImportError("h5py is required for HDF5 geometry import")
+    # Create loader and layers
+    loader = LayerGeometryLoader(debug=False)
+    loader.load_configurations()
+    loader.create_all_layers(wavelength=550.0)
+    
+    # Method 1: Direct layer access
+    print("\n🔍 Method 1: Direct Layer Access")
+    substrate_volume = loader.get_layer('substrate')
+    print(f"  Substrate epsilon volume shape: {substrate_volume.shape}")
+    print(f"  Substrate epsilon values: {np.unique(np.round(np.real(substrate_volume), 2))}")
+    
+    # Method 2: Metadata access
+    print("\n🔍 Method 2: Metadata Access")
+    nitride_metadata = loader.get_layer_metadata('nitride_fin')
+    print(f"  Nitride fin metadata keys: {list(nitride_metadata.keys())}")
+    print(f"  Nitride fin geometry: {nitride_metadata['geometry_type']}")
+    print(f"  Nitride fin dimensions: top_width={nitride_metadata['top_width']}, bottom_width={nitride_metadata['bottom_width']}")
+    
+    # Method 3: Ordered stack access
+    print("\n🔍 Method 3: Ordered Stack Access")
+    ordered_stack = loader.create_ordered_stack()
+    for layer in ordered_stack:
+        if layer['geometry_type'] == 'halfcircle':
+            print(f"  Found halfcircle layer: {layer['layer_name']}")
+            print(f"    Radius: {layer['radius']} nm")
+            print(f"    Sublayers: {layer['num_sublayers']}")
+            break
+
+
+def demo_data_persistence():
+    """Demonstrate saving and loading layer data."""
+    print("\n=== Data Persistence Demo ===")
+    
+    # Create and save layer data
+    print("\n💾 Saving layer data...")
+    loader1 = LayerGeometryLoader(debug=False)
+    loader1.load_configurations()
+    loader1.create_all_layers(wavelength=450.0)  # Blue wavelength
+    loader1.save_layer_data("test_layer_persistence.h5")
+    
+    original_layers = len(loader1.layers)
+    original_wavelength = loader1.current_wavelength
+    
+    # Load layer data into new loader
+    print("\n📂 Loading layer data...")
+    loader2 = LayerGeometryLoader(debug=False)
+    loader2.load_layer_data("test_layer_persistence.h5")
+    
+    # Compare
+    loaded_layers = len(loader2.layers)
+    loaded_wavelength = loader2.current_wavelength
+    
+    print(f"  Original layers: {original_layers}, Loaded layers: {loaded_layers}")
+    print(f"  Original wavelength: {original_wavelength} nm, Loaded wavelength: {loaded_wavelength} nm")
+    print(f"  Data integrity: {'✓ PASS' if original_layers == loaded_layers and abs(original_wavelength - loaded_wavelength) < 0.1 else '✗ FAIL'}")
+    
+    # Verify specific layer
+    original_substrate = loader1.get_layer('substrate')
+    loaded_substrate = loader2.get_layer('substrate')
+    
+    if original_substrate is not None and loaded_substrate is not None:
+        arrays_match = np.allclose(original_substrate, loaded_substrate)
+        print(f"  Substrate data integrity: {'✓ PASS' if arrays_match else '✗ FAIL'}")
+
+
+def main():
+    """Run all demonstration functions."""
+    
+    print("LayerGeometryLoader vs VoxelGeometryLoader Comparison")
+    print("=" * 60)
     
     try:
-        with h5py.File(filename, 'r') as f:
-            epsilon_data = f[dataset_name][:]
+        # Core functionality demos
+        layer_loader = demo_layer_geometry_loader()
+        voxel_loader = demo_voxel_geometry_loader()
         
-        # Convert HDF5 data to MaterialGrid
-        if len(epsilon_data.shape) == 2:
-            # 2D data - add singleton z dimension
-            epsilon_data = epsilon_data[:, :, np.newaxis]
-        elif len(epsilon_data.shape) != 3:
-            raise ValueError("Epsilon data must be 2D or 3D array")
+        # Advanced features
+        compare_wavelength_dependence()
+        demo_layer_access_methods()
+        demo_data_persistence()
         
-        # Normalize epsilon data to weights [0,1]
-        eps_min, eps_max = epsilon_data.min(), epsilon_data.max()
-        weights = (epsilon_data - eps_min) / (eps_max - eps_min)
-        
-        # Create MaterialGrid
-        grid_size = mp.Vector3(*epsilon_data.shape)
-        material_grid = mp.MaterialGrid(
-            grid_size=grid_size,
-            medium1=mp.Medium(epsilon=eps_min),
-            medium2=mp.Medium(epsilon=eps_max),
-            weights=weights.flatten(),
-            do_averaging=True
-        )
-        
-        geometry = [
-            mp.Block(
-                size=mp.Vector3(2.0, 2.0, 0),
-                center=mp.Vector3(0, 0, 0),
-                material=material_grid
-            )
-        ]
-        
-        return geometry
+        print("\n" + "=" * 60)
+        print("✓ All demos completed successfully!")
+        print("\n📋 Summary:")
+        print("  • LayerGeometryLoader: Ideal for analyzing individual layer properties")
+        print("  • VoxelGeometryLoader: Ideal for creating simulation-ready voxel grids")
+        print("  • Both use the same device_config.yaml for consistency")
+        print("  • Both support wavelength-dependent material properties")
+        print("  • Both provide data persistence and analysis capabilities")
         
     except Exception as e:
-        print(f"Error reading HDF5 file {filename}: {e}")
-        # Fallback to simple geometry
-        return create_basic_geometry()
-
-
-def create_geometry_from_epsilon_file(eps_input_file: str) -> List[mp.GeometricObject]:
-    """
-    Create geometry using MEEP's built-in epsilon file support
-    
-    Args:
-        eps_input_file: Path to HDF5 file with epsilon data
-    
-    Note: This uses MEEP's make_file_material function when available
-    """
-    try:
-        # Use MEEP's built-in file material support
-        file_material = mp.Medium(epsilon=1.0)  # Default fallback
-        
-        # In practice, you would set this as the default material
-        # and MEEP would read from the eps_input_file
-        # This requires the Simulation constructor's eps_input_file parameter
-        print(f"Would use epsilon data from {eps_input_file}")
-        print("Use eps_input_file parameter in Simulation constructor for this functionality")
-        
-        # For now, return basic geometry
-        return create_basic_geometry()
-        
-    except Exception as e:
-        print(f"Error with epsilon file {eps_input_file}: {e}")
-        return create_basic_geometry()
-
-
-def create_multilayer_geometry() -> List[mp.GeometricObject]:
-    """
-    Create multilayer structure for thin-film optics
-    """
-    # Example: Anti-reflection coating
-    layers = []
-    layer_materials = [
-        mp.Medium(epsilon=2.25),  # SiO2
-        mp.Medium(epsilon=4.0),   # Si3N4
-        mp.Medium(epsilon=12.0),  # Si substrate
-    ]
-    layer_thicknesses = [0.1, 0.15, 1.0]
-    
-    z_pos = -0.6
-    for material, thickness in zip(layer_materials, layer_thicknesses):
-        layers.append(
-            mp.Block(
-                size=mp.Vector3(mp.inf, mp.inf, thickness),
-                center=mp.Vector3(0, 0, z_pos + thickness/2),
-                material=material
-            )
-        )
-        z_pos += thickness
-    
-    return layers
-
-
-def create_periodic_structure() -> List[mp.GeometricObject]:
-    """
-    Create a periodic structure (grating)
-    """
-    # Grating parameters
-    period = 0.6
-    duty_cycle = 0.4
-    height = 0.3
-    
-    # Single grating element
-    geometry = [
-        mp.Block(
-            size=mp.Vector3(period * duty_cycle, mp.inf, height),
-            center=mp.Vector3(0, 0, 0),
-            material=mp.Medium(epsilon=12.0)
-        )
-    ]
-    
-    return geometry
-
-
-def create_complex_geometry_example() -> List[mp.GeometricObject]:
-    """
-    Example combining multiple geometry types
-    """
-    geometry = []
-    
-    # Substrate
-    geometry.append(
-        mp.Block(
-            size=mp.Vector3(mp.inf, mp.inf, 0.5),
-            center=mp.Vector3(0, 0, -0.25),
-            material=mp.Medium(epsilon=12.0)  # Silicon
-        )
-    )
-    
-    # Cylindrical resonator
-    geometry.append(
-        mp.Cylinder(
-            radius=0.3,
-            height=0.2,
-            center=mp.Vector3(0, 0, 0.1),
-            material=mp.Medium(epsilon=2.25)  # SiO2
-        )
-    )
-    
-    # Metal contact
-    geometry.append(
-        mp.Block(
-            size=mp.Vector3(0.8, 0.1, 0.05),
-            center=mp.Vector3(0, 0, 0.225),
-            material=mp.metal
-        )
-    )
-    
-    return geometry
-
-
-def save_geometry_to_hdf5(geometry_func: Callable, filename: str, 
-                         resolution: int = 64, cell_size: Tuple[float, float, float] = (4, 4, 0)):
-    """
-    Save geometry epsilon distribution to HDF5 file
-    
-    Args:
-        geometry_func: Function that returns MEEP geometry
-        filename: Output HDF5 filename
-        resolution: Grid resolution for sampling
-        cell_size: Size of computational cell
-    """
-    if not HDF5_AVAILABLE:
-        raise ImportError("h5py is required for HDF5 geometry export")
-    
-    try:
-        # Create temporary simulation to extract epsilon
-        sim = mp.Simulation(
-            cell_size=mp.Vector3(*cell_size),
-            geometry=geometry_func(),
-            resolution=resolution,
-            default_material=mp.Medium(epsilon=1.0)
-        )
-        
-        # Initialize the simulation to set up the structure
-        sim.init_sim()
-        
-        # Get epsilon distribution
-        eps_data = sim.get_epsilon()
-        
-        # Save to HDF5
-        with h5py.File(filename, 'w') as f:
-            f.create_dataset('epsilon', data=eps_data)
-            f.attrs['resolution'] = resolution
-            f.attrs['cell_size'] = cell_size
-        
-        print(f"Geometry saved to {filename}")
-        
-    except Exception as e:
-        print(f"Error saving geometry to HDF5: {e}")
-        # Create a simple fallback dataset
-        try:
-            with h5py.File(filename, 'w') as f:
-                # Create a simple 2D epsilon pattern as fallback
-                nx, ny = int(cell_size[0] * resolution), int(cell_size[1] * resolution)
-                eps_fallback = np.ones((nx, ny)) * 1.0  # Air
-                f.create_dataset('epsilon', data=eps_fallback)
-                f.attrs['resolution'] = resolution
-                f.attrs['cell_size'] = cell_size
-                f.attrs['note'] = 'Fallback data due to simulation error'
-            print(f"Fallback geometry data saved to {filename}")
-        except Exception as e2:
-            print(f"Even fallback save failed: {e2}")
-
-
-# ============================================================================
-# MATERIAL DEFINITIONS
-# ============================================================================
-
-def define_dispersive_materials():
-    """
-    Define dispersive materials for realistic simulations
-    """
-    # Silicon with dispersion
-    silicon = mp.Medium(
-        epsilon=11.68,
-        E_susceptibilities=[
-            mp.LorentzianSusceptibility(
-                frequency=3.0, gamma=0.0, sigma=0.01
-            )
-        ]
-    )
-    
-    # Gold using Drude model
-    gold = mp.Medium(
-        epsilon=1.0,
-        E_susceptibilities=[
-            mp.DrudeSusceptibility(
-                frequency=2175.0, gamma=4.35, sigma=4.86e7
-            )
-        ]
-    )
-    
-    # Glass (SiO2)
-    glass = mp.Medium(epsilon=2.25)
-    
-    return {"silicon": silicon, "gold": gold, "glass": glass}
-
-
-# ============================================================================
-# EXAMPLE USAGE
-# ============================================================================
-
-def run_mueller_matrix_analysis():
-    """
-    Run complete Mueller matrix analysis on different geometries
-    """
-    geometries = {
-        "basic": create_basic_geometry,
-        "anisotropic": create_anisotropic_geometry,
-        "material_grid": create_material_grid_geometry,
-        "multilayer": create_multilayer_geometry,
-        "complex": create_complex_geometry_example,
-    }
-    
-    results = {}
-    
-    for name, geom_func in geometries.items():
-        print(f"\nCalculating Mueller matrix for {name} geometry...")
-        try:
-            mueller = calculate_mueller_matrix(geom_func)
-            results[name] = mueller
-            
-            print(f"Mueller matrix for {name}:")
-            print(mueller)
-            
-            # Calculate some derived properties
-            diattenuation = np.sqrt(mueller[0,1]**2 + mueller[0,2]**2 + mueller[0,3]**2) / mueller[0,0]
-            print(f"Diattenuation: {diattenuation:.4f}")
-            
-        except Exception as e:
-            print(f"Error calculating Mueller matrix for {name}: {e}")
-    
-    return results
-
-
-def demonstrate_geometry_methods():
-    """
-    Demonstrate different geometry definition methods
-    """
-    print("MEEP Geometry Definition Methods")
-    print("="*50)
-    
-    print("\n1. Basic Geometric Objects:")
-    basic_geom = create_basic_geometry()
-    for obj in basic_geom:
-        print(f"   - {type(obj).__name__}: {obj}")
-    
-    print("\n2. Anisotropic Materials:")
-    aniso_geom = create_anisotropic_geometry()
-    for obj in aniso_geom:
-        print(f"   - {type(obj).__name__} with anisotropic material")
-    
-    print("\n3. Material Grid (pixel-level control):")
-    grid_geom = create_material_grid_geometry()
-    for obj in grid_geom:
-        print(f"   - {type(obj).__name__} with MaterialGrid")
-    
-    print("\n4. Multilayer Structure:")
-    multilayer_geom = create_multilayer_geometry()
-    for i, obj in enumerate(multilayer_geom):
-        print(f"   - Layer {i+1}: {type(obj).__name__}")
-    
-    print("\n5. Complex Combined Geometry:")
-    complex_geom = create_complex_geometry_example()
-    for i, obj in enumerate(complex_geom):
-        print(f"   - Element {i+1}: {type(obj).__name__}")
-    
-    if HDF5_AVAILABLE:
-        print("\n6. HDF5 Export/Import available")
-    else:
-        print("\n6. HDF5 functionality not available (install h5py)")
+        print(f"\n✗ Demo failed with error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    # Demonstrate geometry methods
-    demonstrate_geometry_methods()
-    
-    print("\n" + "="*50)
-    print("Mueller Matrix Calculation Demo")
-    print("="*50)
-    
-    # Example: Run analysis on basic geometry
-    print("\nTesting Mueller matrix calculation framework...")
-    print("Note: This requires a proper MEEP installation to run simulations")
-    
-    try:
-        # Test basic geometry creation
-        basic_geom = create_basic_geometry()
-        print(f"✓ Basic geometry created: {len(basic_geom)} objects")
-        
-        # Test Jones/Stokes conversion
-        test_jones = np.array([1.0, 0.0])  # Horizontal linear polarization
-        test_stokes = jones_to_stokes(test_jones)
-        print(f"✓ Jones to Stokes conversion: {test_stokes}")
-        
-        # Attempt Mueller matrix calculation (may fail without proper MEEP setup)
-        print("\nAttempting Mueller matrix calculation...")
-        mueller_basic = calculate_mueller_matrix(create_basic_geometry, wavelength=0.54)
-        print("✓ Mueller matrix calculation completed:")
-        print(mueller_basic)
-        
-        # Calculate some derived properties
-        diattenuation = np.sqrt(mueller_basic[0,1]**2 + mueller_basic[0,2]**2 + mueller_basic[0,3]**2) / mueller_basic[0,0]
-        print(f"Diattenuation: {diattenuation:.4f}")
-        
-    except Exception as e:
-        print(f"✗ Mueller matrix calculation failed: {e}")
-        print("\nThis is expected if MEEP is not properly installed or configured.")
-        print("The geometry definition methods still work for setting up simulations.")
-    
-    # Example: Save geometry to HDF5 (if available)
-    if HDF5_AVAILABLE:
-        print("\nTesting HDF5 geometry export...")
-        try:
-            save_geometry_to_hdf5(create_material_grid_geometry, "example_geometry.h5")
-            print("✓ HDF5 export completed")
-        except Exception as e:
-            print(f"✗ HDF5 export failed: {e}")
-    
-    print("\n" + "="*50)
-    print("Summary:")
-    print("- Geometry definition methods: Available")
-    print("- Jones/Stokes conversions: Available") 
-    print("- Mueller matrix framework: Available")
-    print("- MEEP simulation execution: Depends on installation")
-    print("- HDF5 support:", "Available" if HDF5_AVAILABLE else "Not available")
-    
-    print("\nTo run full analysis:")
-    print("  python -c \"from geometry_and_mueller_example import *; run_mueller_matrix_analysis()\"")
-    print("\nTo use in your own code:")
-    print("  from geometry_and_mueller_example import calculate_mueller_matrix, create_basic_geometry")
-    print("  mueller = calculate_mueller_matrix(create_basic_geometry)")
+    main()
