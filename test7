@@ -1,0 +1,704 @@
+"""
+Layer Geometry Loader
+
+This module provides a comprehensive class for loading and creating configurable layer stacks
+from YAML configurations, similar to the VoxelGeometryLoader but focused on layer geometry
+creation and management using device_config.yaml.
+"""
+
+import numpy as np
+import h5py
+from typing import Dict, List, Tuple, Optional, Any
+import os
+
+from device import GeometryConfigLoader
+from material import Material, VOID, OXIDE, NITRIDE, SILICON, SIGE
+from simulation import SimulationConfigLoader
+from create_layers import (
+    create_rectangular_layer,
+    create_trapezoidal_layer,
+    create_halfcircle_layer,
+    create_concave_layer
+)
+
+
+class LayerGeometryLoader:
+    """
+    Integrated class for loading configurable layer stacks from device configurations.
+    
+    This class combines:
+    - Device configuration loading (layers, materials, stack sequences)
+    - Material property management with wavelength dependence
+    - Simulation parameter handling
+    - Layer geometry creation with epsilon volumes
+    - Layer stack visualization and analysis
+    """
+    
+    def __init__(self, 
+                 device_config: str = "device_config.yaml",
+                 simulation_config: str = "simulation_config.yaml",
+                 material_database: Optional[Dict[str, Material]] = None,
+                 debug: bool = False):
+        """
+        Initialize the LayerGeometryLoader.
+        
+        Args:
+            device_config: Path to device configuration YAML file
+            simulation_config: Path to simulation configuration YAML file
+            material_database: Optional custom material database
+            debug: Enable debug output
+        """
+        self.debug = debug
+        self.device_config = device_config
+        self.simulation_config = simulation_config
+        
+        # Initialize loaders
+        self.device_loader = GeometryConfigLoader(device_config)
+        self.simulation_loader = SimulationConfigLoader(simulation_config)
+        
+        # Default material database
+        self.material_database = {
+            'VOID': VOID,
+            'OXIDE': OXIDE,
+            'NITRIDE': NITRIDE,
+            'SILICON': SILICON,
+            'SIGE': SIGE
+        }
+        
+        # Update with custom materials if provided
+        if material_database:
+            self.material_database.update(material_database)
+        
+        # Configuration data
+        self.device_loaded = False
+        self.simulation_loaded = False
+        
+        # Layer data - similar to layer_stack.py structure
+        self.layers: Dict[str, np.ndarray] = {}  # Layer ID -> epsilon volume
+        self.layer_metadata: Dict[str, Dict] = {}  # Layer ID -> metadata
+        self.layer_stack = []  # Ordered stack sequence
+        
+        # Grid parameters
+        self.x_pitch = None
+        self.y_pitch = None
+        self.total_thickness = 0.0
+        
+        # Current wavelength for material properties
+        self.current_wavelength = 500.0
+        
+    def load_configurations(self) -> bool:
+        """Load both device and simulation configurations."""
+        device_success = self.device_loader.load_config()
+        simulation_success = self.simulation_loader.load_config()
+        
+        if device_success:
+            self.device_loaded = True
+            if self.debug:
+                print("✓ Device configuration loaded successfully")
+        else:
+            print("✗ Failed to load device configuration")
+        
+        if simulation_success:
+            self.simulation_loaded = True
+            if self.debug:
+                print("✓ Simulation configuration loaded successfully")
+        else:
+            if self.debug:
+                print("⚠ Warning: Simulation configuration failed to load, using defaults")
+        
+        # Extract grid parameters
+        self._extract_grid_parameters()
+        
+        return device_success  # Only require device config to be successful
+    
+    def _extract_grid_parameters(self):
+        """Extract grid parameters from simulation configuration."""
+        # Set default values
+        self.x_pitch = 1000.0  # Default 1000 nm
+        self.y_pitch = 1000.0  # Default 1000 nm
+        
+        if self.simulation_loaded and hasattr(self.simulation_loader, 'grid') and self.simulation_loader.grid:
+            self.x_pitch = self.simulation_loader.grid.get("X_PITCH", 1000.0)
+            self.y_pitch = self.simulation_loader.grid.get("Y_PITCH", 1000.0)
+            
+            if self.debug:
+                print(f"   Grid parameters: X_PITCH={self.x_pitch}, Y_PITCH={self.y_pitch}")
+        else:
+            if self.debug:
+                print("   Using default grid parameters: X_PITCH=1000.0, Y_PITCH=1000.0")
+        
+        # Calculate total thickness from device configuration
+        if self.device_loaded:
+            self.total_thickness = self.device_loader.get_total_thickness()
+            if self.debug:
+                print(f"   Total stack thickness: {self.total_thickness} nm")
+    
+    def _get_material_eps(self, material_name: str, wavelength: float = None) -> complex:
+        """
+        Get permittivity for a material name at specified wavelength.
+        
+        Args:
+            material_name: Name of the material
+            wavelength: Wavelength in nm (uses current_wavelength if not specified)
+            
+        Returns:
+            Complex permittivity value
+        """
+        if wavelength is None:
+            wavelength = self.current_wavelength
+        
+        if material_name not in self.material_database:
+            if self.debug:
+                print(f"⚠ Warning: Material {material_name} not found, using VOID")
+            return 1.0 + 0j
+        
+        material = self.material_database[material_name]
+        
+        # Update material properties for this wavelength if possible
+        if hasattr(material, 'get_properties'):
+            try:
+                material.get_properties(wavelength)
+            except Exception as e:
+                if self.debug:
+                    print(f"⚠ Warning: Failed to update {material_name} properties at {wavelength}nm: {e}")
+        
+        return material.eps_r
+    
+    def create_all_layers(self, wavelength: float = 500.0) -> bool:
+        """
+        Create all unique layer types defined in the configuration.
+        
+        Args:
+            wavelength: Wavelength in nm for material property calculation
+            
+        Returns:
+            bool: Success status
+        """
+        if not self.device_loaded:
+            raise RuntimeError("Device configuration not loaded")
+        
+        self.current_wavelength = wavelength
+        self.layers.clear()
+        self.layer_metadata.clear()
+        
+        if self.debug:
+            print(f"Creating layers at wavelength {wavelength} nm...")
+        
+        # Create each unique layer type
+        for layer_id, layer_config in self.device_loader.layers.items():
+            try:
+                material_eps = self._get_material_eps(layer_config.material, wavelength)
+                
+                if layer_config.geometry_type == 'trapezoidal':
+                    # Create trapezoidal layer
+                    eps_volume, sublayer_thickness = create_trapezoidal_layer(
+                        thickness=layer_config.thickness,
+                        num_sublayers=layer_config.num_sublayers,
+                        top_width=layer_config.top_width or self.x_pitch * 0.5,
+                        bottom_width=layer_config.bottom_width or self.x_pitch * 0.8,
+                        material_eps=material_eps
+                    )
+                    self.layers[layer_id] = eps_volume
+                    
+                    # Store metadata
+                    self.layer_metadata[layer_id] = {
+                        'sublayer_thickness': sublayer_thickness,
+                        'total_thickness': layer_config.thickness,
+                        'num_sublayers': layer_config.num_sublayers,
+                        'geometry_type': 'trapezoidal',
+                        'material': layer_config.material,
+                        'material_eps': material_eps,
+                        'top_width': layer_config.top_width or self.x_pitch * 0.5,
+                        'bottom_width': layer_config.bottom_width or self.x_pitch * 0.8,
+                        'description': layer_config.description
+                    }
+                    
+                elif layer_config.geometry_type == 'rectangular':
+                    # Create rectangular layer
+                    width = layer_config.width or self.x_pitch
+                    eps_volume = create_rectangular_layer(
+                        thickness=layer_config.thickness,
+                        width=width,
+                        material_eps=material_eps
+                    )
+                    self.layers[layer_id] = eps_volume
+                    
+                    # Store metadata
+                    self.layer_metadata[layer_id] = {
+                        'sublayer_thickness': layer_config.thickness,
+                        'total_thickness': layer_config.thickness,
+                        'num_sublayers': 1,
+                        'geometry_type': 'rectangular',
+                        'material': layer_config.material,
+                        'material_eps': material_eps,
+                        'width': width,
+                        'description': layer_config.description
+                    }
+                
+                elif layer_config.geometry_type == 'halfcircle':
+                    # Create halfcircle layer
+                    radius = layer_config.radius or (layer_config.width or self.x_pitch) / 4
+                    eps_volume, sublayer_thickness = create_halfcircle_layer(
+                        radius=radius,
+                        thickness=layer_config.thickness,
+                        num_sublayers=layer_config.num_sublayers,
+                        material_eps=material_eps
+                    )
+                    self.layers[layer_id] = eps_volume
+                    
+                    # Store metadata
+                    self.layer_metadata[layer_id] = {
+                        'sublayer_thickness': sublayer_thickness,
+                        'total_thickness': layer_config.thickness,
+                        'num_sublayers': layer_config.num_sublayers,
+                        'geometry_type': 'halfcircle',
+                        'material': layer_config.material,
+                        'material_eps': material_eps,
+                        'radius': radius,
+                        'diameter': radius * 2,
+                        'description': layer_config.description
+                    }
+                
+                elif layer_config.geometry_type == 'concave':
+                    # Create concave layer
+                    max_width = layer_config.max_width or self.x_pitch * 0.8
+                    min_width = layer_config.min_width or max_width * 0.5
+                    eps_volume, sublayer_thickness = create_concave_layer(
+                        thickness=layer_config.thickness,
+                        max_width=max_width,
+                        min_width=min_width,
+                        material_eps=material_eps,
+                        num_sublayers=layer_config.num_sublayers
+                    )
+                    self.layers[layer_id] = eps_volume
+                    
+                    # Store metadata
+                    self.layer_metadata[layer_id] = {
+                        'sublayer_thickness': sublayer_thickness,
+                        'total_thickness': layer_config.thickness,
+                        'num_sublayers': layer_config.num_sublayers,
+                        'geometry_type': 'concave',
+                        'material': layer_config.material,
+                        'material_eps': material_eps,
+                        'max_width': max_width,
+                        'min_width': min_width,
+                        'width_difference': max_width - min_width,
+                        'description': layer_config.description
+                    }
+                
+                else:
+                    if self.debug:
+                        print(f"⚠ Unknown geometry type '{layer_config.geometry_type}' for layer '{layer_id}', skipping")
+                    continue
+                
+                if self.debug:
+                    print(f"   ✓ Created layer '{layer_id}': {layer_config.geometry_type} "
+                          f"({layer_config.material}, {layer_config.thickness} nm)")
+                    
+            except Exception as e:
+                print(f"✗ Error creating layer '{layer_id}': {e}")
+                if self.debug:
+                    import traceback
+                    traceback.print_exc()
+                continue
+        
+        if self.debug:
+            print(f"   🎉 Successfully created {len(self.layers)} layer types from configuration")
+        
+        return len(self.layers) > 0
+    
+    def get_layer(self, layer_id: str) -> Optional[np.ndarray]:
+        """
+        Get permittivity volume for a specific layer type.
+        
+        Args:
+            layer_id: Layer identifier from config
+            
+        Returns:
+            numpy array of epsilon volume or None if not found
+        """
+        return self.layers.get(layer_id)
+    
+    def get_all_layer_names(self) -> List[str]:
+        """Get list of all unique layer type names."""
+        return list(self.layers.keys())
+    
+    def get_layer_metadata(self, layer_id: str) -> Dict[str, Any]:
+        """
+        Get metadata for a specific layer type.
+        
+        Args:
+            layer_id: Layer identifier from config
+            
+        Returns:
+            dict: Layer metadata including thickness, sublayer info, etc.
+        """
+        if layer_id not in self.layer_metadata:
+            return {}
+        
+        metadata = self.layer_metadata[layer_id].copy()
+        metadata['eps_volume'] = self.layers.get(layer_id)
+        metadata['layer_name'] = layer_id  # For compatibility
+        metadata['original_name'] = layer_id
+        
+        return metadata
+    
+    def create_ordered_stack(self) -> List[Dict[str, Any]]:
+        """
+        Create an ordered stack following the configuration sequence.
+        
+        Returns:
+            List: Ordered list of layer dictionaries with metadata
+        """
+        if not self.device_loaded:
+            return []
+        
+        ordered_stack = []
+        
+        for layer_entry in self.device_loader.expanded_stack_sequence:
+            layer_id = layer_entry['layer_id']
+            layer_name = layer_entry['layer_name']
+            
+            # Get base metadata
+            metadata = self.get_layer_metadata(layer_id)
+            if not metadata:
+                if self.debug:
+                    print(f"⚠ Warning: No metadata found for layer '{layer_id}', skipping")
+                continue
+            
+            # Update with instance-specific information
+            metadata['layer_name'] = layer_name
+            metadata['original_name'] = layer_id
+            
+            # Add cycle information if present
+            if 'cycle_info' in layer_entry:
+                metadata['cycle_info'] = layer_entry['cycle_info']
+            
+            ordered_stack.append(metadata)
+        
+        # Store for later use
+        self.layer_stack = ordered_stack
+        
+        if self.debug:
+            total_layers = sum(layer['num_sublayers'] for layer in ordered_stack)
+            total_thickness = sum(layer['total_thickness'] for layer in ordered_stack)
+            print(f"   📚 Created ordered stack with {len(ordered_stack)} layer instances")
+            print(f"      Total sublayers: {total_layers}")
+            print(f"      Total thickness: {total_thickness:.2f} nm")
+        
+        return ordered_stack
+    
+    def get_stack_summary(self) -> Dict[str, Any]:
+        """Get a comprehensive summary of the layer stack."""
+        if not self.device_loaded:
+            return {}
+        
+        config_summary = self.device_loader.get_stack_summary()
+        ordered_stack = self.create_ordered_stack()
+        
+        material_counts = {}
+        geometry_counts = {}
+        
+        for layer in ordered_stack:
+            material = layer.get('material', 'UNKNOWN')
+            geometry = layer.get('geometry_type', 'unknown')
+            
+            material_counts[material] = material_counts.get(material, 0) + 1
+            geometry_counts[geometry] = geometry_counts.get(geometry, 0) + 1
+        
+        return {
+            **config_summary,
+            'actual_total_thickness': sum(layer['total_thickness'] for layer in ordered_stack),
+            'actual_total_sublayers': sum(layer['num_sublayers'] for layer in ordered_stack),
+            'layer_instances': [layer['layer_name'] for layer in ordered_stack],
+            'material_distribution': material_counts,
+            'geometry_distribution': geometry_counts,
+            'wavelength': self.current_wavelength,
+            'x_pitch': self.x_pitch,
+            'y_pitch': self.y_pitch
+        }
+    
+    def reload_configuration(self, new_device_config: Optional[str] = None,
+                           new_simulation_config: Optional[str] = None,
+                           wavelength: float = None):
+        """
+        Reload configuration and regenerate layers.
+        
+        Args:
+            new_device_config: New device config file path
+            new_simulation_config: New simulation config file path
+            wavelength: Wavelength for material properties
+        """
+        if new_device_config:
+            self.device_config = new_device_config
+            self.device_loader = GeometryConfigLoader(new_device_config)
+        
+        if new_simulation_config:
+            self.simulation_config = new_simulation_config
+            self.simulation_loader = SimulationConfigLoader(new_simulation_config)
+        
+        # Clear existing data
+        self.layers.clear()
+        self.layer_metadata.clear()
+        self.layer_stack.clear()
+        
+        # Reload configurations
+        self.load_configurations()
+        
+        # Recreate layers
+        if self.device_loaded:
+            wavelength = wavelength or self.current_wavelength
+            self.create_all_layers(wavelength)
+            
+        if self.debug:
+            print(f"   🔄 Reloaded configuration and recreated {len(self.layers)} layer types")
+    
+    def save_layer_data(self, filename: str = "layer_geometry_data.h5"):
+        """
+        Save layer geometries and metadata to HDF5 file.
+        
+        Args:
+            filename: Output filename
+        """
+        if not self.layers:
+            raise RuntimeError("No layers created. Call create_all_layers() first.")
+        
+        with h5py.File(filename, 'w') as f:
+            # Save layer epsilon volumes
+            layers_group = f.create_group('layers')
+            for layer_id, eps_volume in self.layers.items():
+                layers_group.create_dataset(layer_id, data=eps_volume)
+            
+            # Save metadata
+            metadata_group = f.create_group('metadata')
+            for layer_id, metadata in self.layer_metadata.items():
+                layer_meta_group = metadata_group.create_group(layer_id)
+                for key, value in metadata.items():
+                    if key == 'material_eps':
+                        # Handle complex epsilon values
+                        layer_meta_group.attrs[f'{key}_real'] = np.real(value)
+                        layer_meta_group.attrs[f'{key}_imag'] = np.imag(value)
+                    elif isinstance(value, (str, int, float, bool)):
+                        layer_meta_group.attrs[key] = value
+                    elif isinstance(value, np.ndarray):
+                        layer_meta_group.create_dataset(key, data=value)
+            
+            # Save global parameters
+            f.attrs['wavelength'] = self.current_wavelength
+            f.attrs['x_pitch'] = self.x_pitch
+            f.attrs['y_pitch'] = self.y_pitch
+            f.attrs['total_thickness'] = self.total_thickness
+            f.attrs['device_config'] = self.device_config
+            f.attrs['simulation_config'] = self.simulation_config
+            
+            # Save ordered stack sequence
+            if self.layer_stack:
+                stack_group = f.create_group('ordered_stack')
+                for i, layer_info in enumerate(self.layer_stack):
+                    stack_layer_group = stack_group.create_group(f'position_{i}')
+                    for key, value in layer_info.items():
+                        if key == 'material_eps':
+                            stack_layer_group.attrs[f'{key}_real'] = np.real(value)
+                            stack_layer_group.attrs[f'{key}_imag'] = np.imag(value)
+                        elif key == 'eps_volume':
+                            # Skip the large array - reference by layer_id instead
+                            stack_layer_group.attrs['layer_id_ref'] = layer_info.get('original_name', '')
+                        elif isinstance(value, (str, int, float, bool)):
+                            stack_layer_group.attrs[key] = value
+        
+        print(f"Layer geometry data saved to {filename}")
+        if self.debug:
+            print(f"   Saved {len(self.layers)} layer types and {len(self.layer_stack)} stack positions")
+    
+    def load_layer_data(self, filename: str = "layer_geometry_data.h5"):
+        """
+        Load layer geometries and metadata from HDF5 file.
+        
+        Args:
+            filename: Input filename
+        """
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"File {filename} not found")
+        
+        with h5py.File(filename, 'r') as f:
+            # Load layer epsilon volumes
+            if 'layers' in f:
+                self.layers.clear()
+                layers_group = f['layers']
+                for layer_id in layers_group.keys():
+                    self.layers[layer_id] = layers_group[layer_id][:]
+            
+            # Load metadata
+            if 'metadata' in f:
+                self.layer_metadata.clear()
+                metadata_group = f['metadata']
+                for layer_id in metadata_group.keys():
+                    layer_meta_group = metadata_group[layer_id]
+                    metadata = {}
+                    
+                    # Load attributes
+                    for key, value in layer_meta_group.attrs.items():
+                        if key.endswith('_real'):
+                            base_key = key[:-5]
+                            if f'{base_key}_imag' in layer_meta_group.attrs:
+                                real_part = value
+                                imag_part = layer_meta_group.attrs[f'{base_key}_imag']
+                                metadata[base_key] = complex(real_part, imag_part)
+                        elif not key.endswith('_imag'):
+                            metadata[key] = value
+                    
+                    # Load datasets
+                    for key in layer_meta_group.keys():
+                        metadata[key] = layer_meta_group[key][:]
+                    
+                    self.layer_metadata[layer_id] = metadata
+            
+            # Load global parameters
+            self.current_wavelength = f.attrs.get('wavelength', 500.0)
+            self.x_pitch = f.attrs.get('x_pitch', 1000.0)
+            self.y_pitch = f.attrs.get('y_pitch', 1000.0)
+            self.total_thickness = f.attrs.get('total_thickness', 0.0)
+        
+        print(f"Layer geometry data loaded from {filename}")
+        if self.debug:
+            print(f"   Loaded {len(self.layers)} layer types at wavelength {self.current_wavelength} nm")
+    
+    def get_material_color(self, material_name: str, contour: bool = False) -> str:
+        """
+        Get color for a material for visualization.
+        
+        Args:
+            material_name: Material identifier
+            contour: If True, return contour color variant
+            
+        Returns:
+            str: Hex color code
+        """
+        # Default color map for materials
+        base_colors = {
+            'VOID': '#F0F0F0',
+            'OXIDE': '#87CEEB',    # Sky blue
+            'NITRIDE': '#FF6347',  # Tomato red
+            'SILICON': '#4169E1',  # Royal blue
+            'SIGE': '#9932CC'      # Dark orchid
+        }
+        
+        contour_colors = {
+            'VOID': '#D0D0D0',
+            'OXIDE': '#4682B4',    # Steel blue
+            'NITRIDE': '#DC143C',  # Crimson
+            'SILICON': '#191970',  # Midnight blue
+            'SIGE': '#8B008B'      # Dark magenta
+        }
+        
+        color_map = contour_colors if contour else base_colors
+        return color_map.get(material_name, '#CCCCCC')
+    
+    def visualize_cross_section(self, layer_id: str, axis: str = 'z', position: int = None,
+                              output_file: str = None):
+        """
+        Visualize a cross-section of a specific layer's epsilon grid.
+        
+        Args:
+            layer_id: Layer identifier to visualize
+            axis: Axis for cross-section ('x', 'y', or 'z')
+            position: Position along the axis (defaults to middle)
+            output_file: Optional file to save the plot
+        """
+        if layer_id not in self.layers:
+            raise ValueError(f"Layer '{layer_id}' not found")
+        
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("Matplotlib not available for visualization")
+            return
+        
+        eps_volume = self.layers[layer_id]
+        metadata = self.layer_metadata.get(layer_id, {})
+        
+        if position is None:
+            position = eps_volume.shape[{'x': 0, 'y': 1, 'z': 2}[axis]] // 2
+        
+        if axis == 'z':
+            cross_section = eps_volume[:, :, position]
+            plt.title(f'Layer "{layer_id}" Cross-section at z={position}')
+            plt.xlabel('X')
+            plt.ylabel('Y')
+        elif axis == 'y':
+            cross_section = eps_volume[:, position, :]
+            plt.title(f'Layer "{layer_id}" Cross-section at y={position}')
+            plt.xlabel('X')
+            plt.ylabel('Z')
+        elif axis == 'x':
+            cross_section = eps_volume[position, :, :]
+            plt.title(f'Layer "{layer_id}" Cross-section at x={position}')
+            plt.xlabel('Y')
+            plt.ylabel('Z')
+        else:
+            raise ValueError("Axis must be 'x', 'y', or 'z'")
+        
+        # Plot real part of epsilon
+        im = plt.imshow(np.real(cross_section), cmap='viridis', aspect='auto')
+        plt.colorbar(im, label='Real(epsilon)')
+        
+        # Add metadata as text
+        material = metadata.get('material', 'Unknown')
+        geometry = metadata.get('geometry_type', 'unknown')
+        thickness = metadata.get('total_thickness', 0)
+        
+        plt.figtext(0.02, 0.98, f'Material: {material}\nGeometry: {geometry}\nThickness: {thickness:.1f} nm\nWavelength: {self.current_wavelength:.1f} nm',
+                   verticalalignment='top', fontsize=10,
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+        
+        if output_file:
+            plt.savefig(output_file, dpi=150, bbox_inches='tight')
+            if self.debug:
+                print(f"   Cross-section plot saved to: {output_file}")
+        else:
+            plt.show()
+        
+        plt.close()
+
+
+if __name__ == "__main__":
+    # Example usage
+    print("LayerGeometryLoader Demo")
+    print("=" * 50)
+    
+    # Initialize loader
+    loader = LayerGeometryLoader(debug=True)
+    
+    # Load configurations
+    if loader.load_configurations():
+        print("\n✓ Configurations loaded successfully")
+        
+        # Create layers at specific wavelength
+        wavelength = 550.0
+        if loader.create_all_layers(wavelength=wavelength):
+            print(f"\n✓ Layers created at {wavelength} nm")
+            
+            # Show available layers
+            layer_names = loader.get_all_layer_names()
+            print(f"\nAvailable layer types: {layer_names}")
+            
+            # Create ordered stack
+            ordered_stack = loader.create_ordered_stack()
+            print(f"\nOrdered stack: {len(ordered_stack)} layer instances")
+            
+            # Show stack summary
+            summary = loader.get_stack_summary()
+            print(f"\nStack Summary:")
+            print(f"  Total thickness: {summary.get('actual_total_thickness', 0):.1f} nm")
+            print(f"  Total sublayers: {summary.get('actual_total_sublayers', 0)}")
+            print(f"  Materials: {summary.get('material_distribution', {})}")
+            print(f"  Geometries: {summary.get('geometry_distribution', {})}")
+            
+            # Save layer data
+            loader.save_layer_data("demo_layer_geometry.h5")
+            print("\n✓ Layer data saved successfully")
+            
+        else:
+            print("\n✗ Failed to create layers")
+    else:
+        print("\n✗ Failed to load configurations")
